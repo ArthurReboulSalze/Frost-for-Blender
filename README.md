@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="Frost4Blender.png" alt="Frost for Blender" width="210">
-</p>
-
 # Frost Particle Meshing for Blender
 
 Frost Particle Meshing is a Blender addon that converts particles, point clouds, and mesh vertices into polygonal surfaces.
