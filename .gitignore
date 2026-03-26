@@ -2,6 +2,7 @@
 build/
 build_*/
 $(Configuration)/
+# Local build/versioning history. Keep out of the GitHub source repo.
 logs/
 temp_frost_update/
 frost_blender_addon.zip
@@ -48,3 +49,7 @@ deps/vcpkg/buildtrees/
 deps/vcpkg/downloads/
 deps/vcpkg/installed/
 deps/vcpkg/packages/
+
+# Auto-generated agent rules (personalized per developer)
+.brainsync/
+.brainsync/agent-rules.md

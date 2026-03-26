@@ -43,6 +43,7 @@ if errorlevel 1 (
 
 echo Copying extension to addon folder...
 copy Release\*.pyd ..\frost_blender_addon\blender_frost_adapter.pyd
+if exist Release\frost_native.dll copy Release\frost_native.dll ..\frost_blender_addon\
 if exist Release\blender_frost_adapter.dll copy Release\blender_frost_adapter.dll ..\frost_blender_addon\
 
 echo ==========================================

@@ -3,7 +3,9 @@ project(blender_frost_adapter)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-option(FROST_ENABLE_CUDA "Build the CUDA backend" ON)
+option(FROST_ENABLE_CUDA "Build the CUDA backend" OFF)
+option(FROST_ENABLE_VULKAN_PROBE "Build Vulkan support and runtime probes" ON)
+option(FROST_BUILD_PYTHON_MODULE "Build the legacy pybind11 module" OFF)
 
 # Global settings that are safe/required
 set(CMAKE_CXX_STANDARD 17)
@@ -12,21 +14,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Add Thinkbox CM Library to module path
 set(CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/../deps/thinkbox-cm-library)
 
-# Find packages
-# Manually specify Python 3.11 paths found on system
-set(Python_EXECUTABLE "C:/Program Files/Blender Foundation/blender 5.0.1/5.0/python/bin/python.exe") 
-set(Python_LIBRARY "C:/Users/aroxl/text-generation-webui/installer_files/env/libs/python311.lib")
-set(Python_INCLUDE_DIR "C:/Users/aroxl/text-generation-webui/installer_files/env/include")
-
-find_package(Python 3.11 EXACT COMPONENTS Interpreter Development REQUIRED)
-find_package(pybind11 CONFIG REQUIRED)
-
 find_package(Boost REQUIRED)
 find_package(TBB REQUIRED)
 find_package(OpenEXR REQUIRED)
 find_package(tinyxml2 REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(xxHash REQUIRED)
+find_package(glslang CONFIG REQUIRED)
+
+if(FROST_BUILD_PYTHON_MODULE)
+    find_package(Python COMPONENTS Interpreter Development REQUIRED)
+    find_package(pybind11 CONFIG REQUIRED)
+endif()
 
 # Include directories will be added to target
 
@@ -64,19 +63,32 @@ if(FROST_ENABLE_CUDA)
 endif()
 
 # Add source files
-set(SOURCE_FILES
-    src/adapter.cpp
+set(FROST_NATIVE_SOURCES
     src/frost_interface.cpp
+    src/gpu_backend.cpp
+    src/frost_native_api.cpp
+    src/vulkan_backend.cpp
+    src/vulkan_compute_shader.cpp
+    src/vulkan_probe.cpp
+    src/vulkan_compute_probe.cpp
+    src/vulkan_buffer_probe.cpp
 )
 
-# Create module
-pybind11_add_module(blender_frost_adapter ${SOURCE_FILES})
+# Create stable native library (usable from ctypes across Blender Python versions)
+add_library(frost_native SHARED ${FROST_NATIVE_SOURCES})
+set_target_properties(frost_native PROPERTIES OUTPUT_NAME "frost_native")
 
 # Link libraries
-target_link_libraries(blender_frost_adapter PRIVATE
+target_link_libraries(frost_native PRIVATE
     frost
     thinkboxlibrary
     Boost::boost
+    glslang::glslang
+    glslang::SPIRV
+    glslang::OSDependent
+    glslang::MachineIndependent
+    glslang::GenericCodeGen
+    glslang::glslang-default-resource-limits
     OpenEXR::OpenEXR
     TBB::tbb
     tinyxml2::tinyxml2
@@ -84,36 +96,58 @@ target_link_libraries(blender_frost_adapter PRIVATE
 )
 
 if(FROST_ENABLE_CUDA)
-    target_link_libraries(blender_frost_adapter PRIVATE
+    target_link_libraries(frost_native PRIVATE
         frost_cuda
         cuNSearch
     )
 endif()
 
 # Apply Forced Include only to this target (and its dependencies that need it)
-target_compile_options(blender_frost_adapter PRIVATE /FI"${CMAKE_SOURCE_DIR}/src/compat_headers.hpp")
+target_compile_options(frost_native PRIVATE /FI"${CMAKE_SOURCE_DIR}/src/compat_headers.hpp")
 # Apply general compile options
-target_compile_options(blender_frost_adapter PRIVATE /wd4834)
+target_compile_options(frost_native PRIVATE /wd4834)
 # Apply definitions
-target_compile_definitions(blender_frost_adapter PRIVATE 
+target_compile_definitions(frost_native PRIVATE 
     BOOST_BIND_GLOBAL_PLACEHOLDERS
     UNICODE _UNICODE NOMINMAX
 )
 
 if(FROST_ENABLE_CUDA)
-    target_compile_definitions(blender_frost_adapter PRIVATE FROST_ENABLE_CUDA)
+    target_compile_definitions(frost_native PRIVATE FROST_ENABLE_CUDA)
+endif()
+
+if(FROST_ENABLE_VULKAN_PROBE)
+    target_compile_definitions(frost_native PRIVATE FROST_ENABLE_VULKAN_PROBE)
 endif()
 
 # Include directories (Moved from global)
-target_include_directories(blender_frost_adapter PRIVATE
+target_include_directories(frost_native PRIVATE
     ${CMAKE_SOURCE_DIR}/inc_compat
+    ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/../deps/thinkbox-library/include
     ${CMAKE_SOURCE_DIR}/../thinkbox-frost
+    ${CMAKE_SOURCE_DIR}/../deps/Vulkan-Headers/include
     ${CMAKE_SOURCE_DIR}/../deps/vcpkg/installed/x64-windows/include
     ${CMAKE_SOURCE_DIR}/../deps/vcpkg/installed/x64-windows/include/eigen3
     ${CMAKE_SOURCE_DIR}/../deps/vcpkg/installed/x64-windows/include/Imath
     ${CMAKE_SOURCE_DIR}/../deps/vcpkg/installed/x64-windows/include/OpenEXR
 )
+
+if(FROST_BUILD_PYTHON_MODULE)
+    pybind11_add_module(blender_frost_adapter src/adapter.cpp)
+    target_link_libraries(blender_frost_adapter PRIVATE
+        frost_native
+        TBB::tbb
+    )
+    target_compile_options(blender_frost_adapter PRIVATE /wd4834)
+    target_compile_definitions(blender_frost_adapter PRIVATE
+        BOOST_BIND_GLOBAL_PLACEHOLDERS
+        UNICODE _UNICODE NOMINMAX
+    )
+    target_include_directories(blender_frost_adapter PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+    )
+endif()
 
 # Dependencies also need the shim for Boost/Imath compatibility and warning suppression
 if(TARGET frost)

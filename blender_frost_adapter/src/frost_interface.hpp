@@ -1,32 +1,33 @@
 #pragma once
 
-#include <vector>
-#include <string>
-#include <tuple>
+#include <cstddef>
 #include <memory>
-#include <pybind11/pybind11.h>
-#include <pybind11/numpy.h>
+#include <string>
+#include <vector>
 
 class FrostInterface {
 public:
     FrostInterface();
     ~FrostInterface();
 
-    // Set particle data from NumPy arrays
+    static bool has_gpu_backend();
+    static std::string get_gpu_backend_name();
+
+    // Set particle data from raw contiguous arrays.
+    // positions and velocities use XYZXYZ... layout.
     void set_particles(
-        pybind11::array_t<float> positions,
-        pybind11::array_t<float> radii,
-        pybind11::object velocities = pybind11::none()
+        const float* positions,
+        size_t particleCount,
+        const float* radii,
+        const float* velocities = nullptr
     );
 
-    // Set a single parameter
-    void set_parameter(const std::string& name, pybind11::object value);
-    
-    // Set multiple parameters from a dictionary
-    void set_parameters(pybind11::dict params);
+    void set_parameter(const std::string& name, bool value);
+    void set_parameter(const std::string& name, int value);
+    void set_parameter(const std::string& name, float value);
 
-    // Generate mesh and return (vertices, faces) tuple
-    std::tuple<pybind11::array_t<float>, pybind11::array_t<int>> generate_mesh();
+    // Generate mesh into flat XYZ and triangle-index buffers.
+    void generate_mesh(std::vector<float>& vertices, std::vector<int>& faces);
 
 private:
     struct Impl;

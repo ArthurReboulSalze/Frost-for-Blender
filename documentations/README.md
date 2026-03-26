@@ -2,8 +2,8 @@
 
 This folder contains the maintained documentation for the current addon release.
 
-Current addon version: `1.23.0`
-Last update: `2026-03-22`
+Current addon version: `1.24.1`
+Last update: `2026-03-26`
 
 ## Available Documents
 
@@ -38,9 +38,15 @@ For development and maintenance:
 
 Release history and recent technical changes.
 
+### Versioning Workflow
+
+[VERSIONING_WORKFLOW.md](VERSIONING_WORKFLOW.md)
+
+How to use the root `logs/` folder to track internal build iterations and map them cleanly to public addon releases.
+
 ## Quick Start
 
-1. Install or symlink `frost_blender_addon` into Blender's addon folder.
+1. Install the current release zip from GitHub Releases, or symlink `frost_blender_addon` into Blender's addon folder.
 2. Enable the addon in Blender.
 3. Create or select a Frost object.
 4. Set a source object in the Frost panel.
@@ -56,3 +62,4 @@ For GPU mode, the main controls are:
 
 - The GPU UI no longer exposes `Block Size`, `Low Density Trimming`, or `Surface Refinement`.
 - For `MESH` sources, Frost currently reads the raw mesh data and does not automatically evaluate a non-applied `Subdivision Surface` modifier.
+- The current public release package is a single Blender-installable zip for the `CPU + Vulkan` workflow.

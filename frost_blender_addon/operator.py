@@ -21,8 +21,12 @@ try:
     # Add addon directory to DLL search path for dependencies (TBB, Boost, etc.)
     if hasattr(os, "add_dll_directory"):
         os.add_dll_directory(os.path.dirname(__file__))
-    
-    from . import blender_frost_adapter
+
+    try:
+        from . import native_bridge as blender_frost_adapter
+    except ImportError as native_exc:
+        from . import blender_frost_adapter
+        adapter_load_error = f"Native bridge unavailable: {native_exc}"
 except ImportError as e:
     blender_frost_adapter = None
     adapter_load_error = f"{str(e)} | Py: {sys.version.split()[0]}"
@@ -31,6 +35,60 @@ except Exception as e:
     adapter_load_error = f"Unexpected error: {str(e)} | Py: {sys.version.split()[0]}"
 
 import gc
+
+
+def has_native_backend():
+    return blender_frost_adapter is not None
+
+
+def get_gpu_backend_name():
+    if blender_frost_adapter is None:
+        return "none"
+    return str(getattr(blender_frost_adapter, "GPU_BACKEND_NAME", "cuda" if getattr(blender_frost_adapter, "HAS_CUDA_BACKEND", False) else "none"))
+
+
+def has_gpu_backend():
+    if blender_frost_adapter is None:
+        return False
+    if hasattr(blender_frost_adapter, "HAS_GPU_BACKEND"):
+        return bool(getattr(blender_frost_adapter, "HAS_GPU_BACKEND"))
+    return bool(getattr(blender_frost_adapter, "HAS_CUDA_BACKEND", False))
+
+
+def has_vulkan_runtime():
+    if blender_frost_adapter is None:
+        return False
+    return bool(getattr(blender_frost_adapter, "HAS_VULKAN_RUNTIME", False))
+
+
+def get_vulkan_runtime_status():
+    if blender_frost_adapter is None:
+        return ""
+    return str(getattr(blender_frost_adapter, "VULKAN_RUNTIME_STATUS", ""))
+
+
+def has_vulkan_compute():
+    if blender_frost_adapter is None:
+        return False
+    return bool(getattr(blender_frost_adapter, "HAS_VULKAN_COMPUTE", False))
+
+
+def get_vulkan_compute_status():
+    if blender_frost_adapter is None:
+        return ""
+    return str(getattr(blender_frost_adapter, "VULKAN_COMPUTE_STATUS", ""))
+
+
+def has_vulkan_storage_buffer():
+    if blender_frost_adapter is None:
+        return False
+    return bool(getattr(blender_frost_adapter, "HAS_VULKAN_STORAGE_BUFFER", False))
+
+
+def get_vulkan_storage_buffer_status():
+    if blender_frost_adapter is None:
+        return ""
+    return str(getattr(blender_frost_adapter, "VULKAN_STORAGE_BUFFER_STATUS", ""))
 
 # Performance Optimization: Cache FrostInterface per object to avoid recreation overhead
 _frost_cache = {}
@@ -184,6 +242,10 @@ def update_frost_mesh(obj, context):
     try:
         # Get or create cached FrostInterface (avoids recreation overhead)
         frost = get_cached_frost(id(obj))
+        gpu_backend_available = has_gpu_backend()
+        gpu_backend_name = get_gpu_backend_name()
+        if frost_props.use_gpu and not gpu_backend_available and frost_props.show_debug_log:
+            print(f"Frost: no GPU backend is available in the current native build ({gpu_backend_name}), falling back to CPU.")
         
         # Transform World Space Particles -> Local Space of Frost Object
         # Extracted particles are in World Space.
@@ -280,7 +342,7 @@ def update_frost_mesh(obj, context):
             "anisotropic_position_smoothing_weight": frost_props.anisotropic_position_smoothing_weight,
             
             # GPU settings
-            "use_gpu": frost_props.use_gpu,
+            "use_gpu": bool(frost_props.use_gpu and gpu_backend_available),
             "gpu_search_radius_scale": frost_props.gpu_search_radius_scale,
             "gpu_voxel_size": frost_props.gpu_voxel_size,
             "gpu_block_size": 256,

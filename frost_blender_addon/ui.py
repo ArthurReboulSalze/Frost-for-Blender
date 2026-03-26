@@ -207,7 +207,7 @@ class FrostProperties(PropertyGroup):
     # Core Mesh Settings
     use_gpu: BoolProperty(
         name="GPU Acceleration",
-        description="Enable CUDA acceleration (Experimental)",
+        description="Enable the available GPU backend when the current native build supports one",
         default=False,
         update=update_mesh_callback
     )
@@ -233,7 +233,7 @@ class FrostProperties(PropertyGroup):
     
     gpu_block_size: IntProperty(
         name="Block Size",
-        description="CUDA thread block size (power of 2)",
+        description="Internal GPU workgroup size",
         default=256,
         min=64,
         max=1024,
@@ -242,9 +242,9 @@ class FrostProperties(PropertyGroup):
     
     gpu_meshing_method: EnumProperty(
         name="GPU Method",
-        description="GPU meshing algorithm",
+        description="Legacy dedicated GPU meshing algorithm",
         items=[
-            ('ZHU_BRIDSON_GPU', "Zhu-Bridson GPU", "Fluid meshing with GPU neighbor search"),
+            ('ZHU_BRIDSON_GPU', "Zhu-Bridson GPU", "Fluid meshing with the active GPU backend"),
             # ('METABALL_GPU', "Metaball GPU", "Smooth blobby surface with GPU acceleration"), # Not implemented yet
             # ('ANISOTROPIC_GPU', "Anisotropic GPU", "Stretched metaballs with GPU neighbor search"), # Not implemented yet
         ],
@@ -493,16 +493,25 @@ class FROST_PT_main_panel(Panel):
         
         # Header / Status
         from . import operator
-        if operator.adapter_load_error:
+        gpu_backend_available = operator.has_gpu_backend()
+        gpu_backend_name = operator.get_gpu_backend_name().lower()
+        is_vulkan_backend = gpu_backend_name.startswith("vulkan")
+        if operator.blender_frost_adapter is None and operator.adapter_load_error:
              box = layout.box()
              box.alert = True
              box.label(text="Core Load Error", icon='ERROR')
+             box.label(text=operator.adapter_load_error)
+        elif operator.adapter_load_error:
+             box = layout.box()
+             box.label(text="Native Bridge Note", icon='INFO')
              box.label(text=operator.adapter_load_error)
         
         # Top Row: Auto Update toggle
         row = layout.row()
         row.prop(frost_props, "auto_update", icon="FILE_REFRESH")
-        row.prop(frost_props, "use_gpu", toggle=True, icon='SHADING_RENDERED')
+        gpu_toggle = row.row()
+        gpu_toggle.enabled = gpu_backend_available
+        gpu_toggle.prop(frost_props, "use_gpu", toggle=True, icon='SHADING_RENDERED')
         
         # Main Generate/Bake Button
         # Show Create button if no source, otherwise show Bake
@@ -567,12 +576,12 @@ class FROST_PT_main_panel(Panel):
         box = layout.box()
         box.label(text="Meshing:", icon='MESH_ICOSPHERE')
         
-        if frost_props.use_gpu:
+        if frost_props.use_gpu and gpu_backend_available and not is_vulkan_backend:
             # === GPU MODE ===
             # Method
             box.prop(frost_props, "gpu_meshing_method", text="")
-            
-        if frost_props.use_gpu:
+             
+        if frost_props.use_gpu and gpu_backend_available and not is_vulkan_backend:
             # GPU Mode: Unified controls
             res_box = box.box()
             res_box.label(text="GPU Resolution:", icon='PREFERENCES')
@@ -592,12 +601,19 @@ class FROST_PT_main_panel(Panel):
             res_box.prop(frost_props, "gpu_search_radius_scale", text="Search Radius Scale")
             
             info_row = box.row()
-            info_row.label(text="CUDA Accelerated", icon='EXPERIMENTAL')
+            backend_name = operator.get_gpu_backend_name().upper()
+            info_row.label(text=f"GPU Backend: {backend_name}", icon='EXPERIMENTAL')
             if frost_props.show_debug_log:
                  info_row.label(text="Debug Logs On", icon='CONSOLE')
 
         else:
             # === CPU MODE ===
+            if frost_props.use_gpu and gpu_backend_available and is_vulkan_backend:
+                warn_row = box.row()
+                warn_row.label(text="Experimental Vulkan backend: particle preprocessing uses Vulkan compute, final meshing still uses the Frost method below", icon='INFO')
+            elif frost_props.use_gpu and not gpu_backend_available:
+                warn_row = box.row()
+                warn_row.label(text="Current build has no GPU backend, using CPU settings", icon='INFO')
             box.prop(frost_props, "meshing_method", text="")
         
             # CPU Resolution Settings
@@ -621,7 +637,7 @@ class FROST_PT_main_panel(Panel):
         method_box = layout.box()
         method_box.label(text="Settings", icon='SETTINGS')
         
-        if frost_props.use_gpu:
+        if frost_props.use_gpu and gpu_backend_available and not is_vulkan_backend:
             method_box.label(text="Zhu-Bridson GPU", icon='MOD_FLUIDSIM')
             method_box.label(text="GPU settings are handled above", icon='INFO')
         else:
@@ -688,11 +704,28 @@ class FROST_PT_info_panel(Panel):
         
         if obj:
             frost_props = obj.frost_properties
-            if frost_props.use_gpu:
+            from . import operator
+            backend_name = operator.get_gpu_backend_name().upper()
+            layout.label(text=f"GPU Backend: {backend_name}", icon='SHADING_RENDERED' if operator.has_gpu_backend() else 'INFO')
+            layout.label(
+                text=f"Vulkan Runtime: {'Detected' if operator.has_vulkan_runtime() else 'Not detected'}",
+                icon='CHECKMARK' if operator.has_vulkan_runtime() else 'INFO'
+            )
+            layout.label(
+                text=f"Vulkan Compute: {'Ready' if operator.has_vulkan_compute() else 'Not ready'}",
+                icon='CHECKMARK' if operator.has_vulkan_compute() else 'INFO'
+            )
+            layout.label(
+                text=f"Vulkan Buffers: {'Ready' if operator.has_vulkan_storage_buffer() else 'Not ready'}",
+                icon='CHECKMARK' if operator.has_vulkan_storage_buffer() else 'INFO'
+            )
+            if frost_props.use_gpu and operator.has_gpu_backend():
                  row = layout.row()
-                 row.label(text="CUDA: Enabled (Experimental)", icon='SHADING_RENDERED')
+                 row.label(text="GPU Acceleration: Enabled", icon='SHADING_RENDERED')
+            elif operator.has_gpu_backend():
+                 layout.label(text="GPU Acceleration: Disabled", icon='X')
             else:
-                 layout.label(text="CUDA: Disabled", icon='X')
+                 layout.label(text="GPU Acceleration: Not available in current build", icon='INFO')
 
         # Debug Toggle in Info Panel as well (or keep it here if main panel is crowded)
         if obj:
