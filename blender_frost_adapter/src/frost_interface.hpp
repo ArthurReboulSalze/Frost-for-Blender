@@ -12,6 +12,9 @@ public:
 
     static bool has_gpu_backend();
     static std::string get_gpu_backend_name();
+    std::string get_last_meshing_backend() const;
+    std::string get_last_meshing_status() const;
+    bool get_last_meshing_used_fallback() const;
 
     // Set particle data from raw contiguous arrays.
     // positions and velocities use XYZXYZ... layout.

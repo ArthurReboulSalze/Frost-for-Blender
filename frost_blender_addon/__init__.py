@@ -10,17 +10,17 @@ Supported Methods:
 - Zhu-Bridson: Advanced fluid meshing
 
 Author: Arthur Reboul Salze
-Version: 1.24.1
+Version: 1.25.0
 Blender: 5+
 """
 
 bl_info = {
     "name": "Frost Particle Meshing",
     "author": "Arthur Reboul Salze",
-    "version": (1, 24, 1),
+    "version": (1, 25, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Frost",
-    "description": "Particle meshing plugin with Thinkbox CPU and optional GPU backends.",
+    "description": "Particle meshing plugin with Thinkbox CPU and the current Vulkan GPU backend work.",
     "warning": "",
     "doc_url": "https://github.com/ArthurReboulSalze/Frost-for-Blender",
     "category": "Mesh",

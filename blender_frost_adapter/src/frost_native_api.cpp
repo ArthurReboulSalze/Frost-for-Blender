@@ -203,6 +203,25 @@ FROST_NATIVE_API const char *Frost_GetLastError(void *handle) {
   return ctx->lastError.c_str();
 }
 
+FROST_NATIVE_API const char *Frost_GetLastMeshingBackend(void *handle) {
+  auto *ctx = as_context(handle);
+  static std::string backendName;
+  backendName = ctx ? ctx->frost.get_last_meshing_backend() : "";
+  return backendName.c_str();
+}
+
+FROST_NATIVE_API const char *Frost_GetLastMeshingStatus(void *handle) {
+  auto *ctx = as_context(handle);
+  static std::string statusMessage;
+  statusMessage = ctx ? ctx->frost.get_last_meshing_status() : "";
+  return statusMessage.c_str();
+}
+
+FROST_NATIVE_API int Frost_GetLastMeshingUsedFallback(void *handle) {
+  auto *ctx = as_context(handle);
+  return (ctx && ctx->frost.get_last_meshing_used_fallback()) ? 1 : 0;
+}
+
 FROST_NATIVE_API int Frost_HasGpuBackend() {
   return FrostInterface::has_gpu_backend() ? 1 : 0;
 }

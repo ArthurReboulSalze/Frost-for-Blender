@@ -1,22 +1,20 @@
-# Frost Particle Meshing - Documentation Index
+# Frost for Blender - Documentation Index
 
-This folder contains the maintained documentation for the current addon release.
+Current addon version: `1.25.0`  
+Last update: `2026-03-27`
 
-Current addon version: `1.24.1`
-Last update: `2026-03-26`
-
-## Available Documents
+## Main Documents
 
 ### User Guide
 
 [USER_GUIDE.md](USER_GUIDE.md)
 
-For artists and day-to-day usage:
+For day-to-day usage:
 
 - installation
 - panel overview
-- CPU and GPU settings
-- animation workflow
+- CPU and GPU workflow
+- animation
 - troubleshooting
 
 ### Technical Reference
@@ -25,41 +23,22 @@ For artists and day-to-day usage:
 
 For development and maintenance:
 
-- architecture
+- addon architecture
 - native bridge
-- CUDA pipeline
-- parameter mapping
+- CPU / CUDA / Vulkan backend structure
+- current limits
 - build notes
-- current limitations
 
 ### Changelog
 
 [CHANGELOG.md](CHANGELOG.md)
 
-Release history and recent technical changes.
+Release history and notable technical changes.
 
-### Versioning Workflow
+## Quick Notes
 
-[VERSIONING_WORKFLOW.md](VERSIONING_WORKFLOW.md)
-
-How to use the root `logs/` folder to track internal build iterations and map them cleanly to public addon releases.
-
-## Quick Start
-
-1. Install the current release zip from GitHub Releases, or symlink `frost_blender_addon` into Blender's addon folder.
-2. Enable the addon in Blender.
-3. Create or select a Frost object.
-4. Set a source object in the Frost panel.
-5. Choose CPU or GPU meshing.
-
-For GPU mode, the main controls are:
-
-1. `Resolution Mode`
-2. `Subdivisions` or `Voxel Length`
-3. `Search Radius Scale`
-
-## Notes
-
-- The GPU UI no longer exposes `Block Size`, `Low Density Trimming`, or `Surface Refinement`.
-- For `MESH` sources, Frost currently reads the raw mesh data and does not automatically evaluate a non-applied `Subdivision Surface` modifier.
-- The current public release package is a single Blender-installable zip for the `CPU + Vulkan` workflow.
+- The public package is now a single Blender zip for the current `CPU + Vulkan` workflow.
+- The Vulkan backend is still in active development.
+- Current testing indicates that Vulkan is usually slower than CPU on low-poly scenes, while heavier / high-poly scenes can already favor Vulkan depending on the case.
+- `Vertex Refinement` still forces the final surface build back to the CPU path.
+- `MESH` sources still read raw mesh data, so non-applied mesh modifiers are not automatically evaluated yet.

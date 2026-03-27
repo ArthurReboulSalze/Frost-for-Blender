@@ -75,6 +75,15 @@ _lib.Frost_CopyFaces.restype = ctypes.c_int
 _lib.Frost_GetLastError.argtypes = [ctypes.c_void_p]
 _lib.Frost_GetLastError.restype = ctypes.c_char_p
 
+_lib.Frost_GetLastMeshingBackend.argtypes = [ctypes.c_void_p]
+_lib.Frost_GetLastMeshingBackend.restype = ctypes.c_char_p
+
+_lib.Frost_GetLastMeshingStatus.argtypes = [ctypes.c_void_p]
+_lib.Frost_GetLastMeshingStatus.restype = ctypes.c_char_p
+
+_lib.Frost_GetLastMeshingUsedFallback.argtypes = [ctypes.c_void_p]
+_lib.Frost_GetLastMeshingUsedFallback.restype = ctypes.c_int
+
 _lib.Frost_HasGpuBackend.argtypes = []
 _lib.Frost_HasGpuBackend.restype = ctypes.c_int
 
@@ -152,6 +161,15 @@ class FrostInterface:
         if not message:
             return "Unknown Frost native error"
         return message.decode("utf-8", errors="replace")
+
+    def get_last_meshing_info(self):
+        backend = _lib.Frost_GetLastMeshingBackend(self._handle)
+        status = _lib.Frost_GetLastMeshingStatus(self._handle)
+        return {
+            "backend": (backend or b"").decode("utf-8", errors="replace"),
+            "status": (status or b"").decode("utf-8", errors="replace"),
+            "used_fallback": bool(_lib.Frost_GetLastMeshingUsedFallback(self._handle)),
+        }
 
     def _require_ok(self, result, action):
         if result:

@@ -70,7 +70,10 @@ struct VulkanSurfaceMeshResult {
 struct VulkanResidentSurfaceMeshView {
   const uint32_t *triangleCounts = nullptr;
   const float *triangleVertices = nullptr;
+  const uint32_t *triangleOffsets = nullptr;
+  const uint32_t *triangleEdgeIds = nullptr;
   uint32_t activeCellCount = 0;
+  uint32_t totalTriangleCount = 0;
   bool triangleVerticesCompacted = false;
 };
 
@@ -124,6 +127,15 @@ bool get_frost_vulkan_resident_surface_mesh_view(
 
 bool get_frost_vulkan_resident_compact_surface_vertex_view(
     uint32_t totalTriangleCount, const float *&outTriangleVertices,
+    std::string &outError);
+
+bool get_frost_vulkan_resident_compact_surface_edge_id_view(
+    uint32_t totalTriangleCount, const uint32_t *&outTriangleEdgeIds,
+    std::string &outError);
+
+bool run_frost_vulkan_generate_deduplicated_surface_mesh(
+    uint32_t totalTriangleCount, uint32_t totalEdgeCount,
+    std::vector<float> &outVertices, std::vector<int> &outFaces,
     std::string &outError);
 
 bool run_frost_vulkan_generate_dense_surface_mesh(

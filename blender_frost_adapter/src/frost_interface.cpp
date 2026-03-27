@@ -21,6 +21,64 @@
 
 namespace {
 
+bool validate_raw_mesh_buffers(const std::vector<float> &vertices,
+                               const std::vector<int> &faces,
+                               std::string &outError) {
+  outError.clear();
+
+  if (vertices.size() % 3u != 0u) {
+    outError = "mesh vertex buffer size is not divisible by 3";
+    return false;
+  }
+
+  if (faces.size() % 3u != 0u) {
+    outError = "mesh face buffer size is not divisible by 3";
+    return false;
+  }
+
+  const std::size_t vertexCount = vertices.size() / 3u;
+  const std::size_t faceCount = faces.size() / 3u;
+
+  if (vertexCount == 0u || faceCount == 0u) {
+    if (vertexCount == 0u && faceCount == 0u) {
+      return true;
+    }
+    outError = "mesh buffers contain vertices or faces, but not both";
+    return false;
+  }
+
+  for (std::size_t i = 0; i < vertices.size(); ++i) {
+    const float value = vertices[i];
+    if (!std::isfinite(value)) {
+      outError = "mesh vertex buffer contains a non-finite coordinate";
+      return false;
+    }
+  }
+
+  for (std::size_t faceIndex = 0; faceIndex < faceCount; ++faceIndex) {
+    const std::size_t base = faceIndex * 3u;
+    const int i0 = faces[base + 0u];
+    const int i1 = faces[base + 1u];
+    const int i2 = faces[base + 2u];
+    if (i0 < 0 || i1 < 0 || i2 < 0) {
+      outError = "mesh face buffer contains a negative vertex index";
+      return false;
+    }
+    if (static_cast<std::size_t>(i0) >= vertexCount ||
+        static_cast<std::size_t>(i1) >= vertexCount ||
+        static_cast<std::size_t>(i2) >= vertexCount) {
+      outError = "mesh face buffer contains an out-of-range vertex index";
+      return false;
+    }
+    if (i0 == i1 || i1 == i2 || i0 == i2) {
+      outError = "mesh face buffer contains a degenerate triangle";
+      return false;
+    }
+  }
+
+  return true;
+}
+
 // Build edge-use map to identify non-manifold and boundary edges
 // Returns true if mesh is fully manifold (no boundary edges)
 bool is_manifold_closed(const frantic::geometry::trimesh3 &mesh) {
@@ -342,6 +400,9 @@ struct FrostInterface::Impl {
   frost_parameters params;
   frantic::particles::particle_array particles;
   std::unique_ptr<FrostGpuBackend> gpu_backend;
+  std::string last_meshing_backend = "cpu";
+  std::string last_meshing_status;
+  bool last_meshing_used_fallback = false;
 
   // Default constructor
   Impl() {
@@ -379,6 +440,18 @@ bool FrostInterface::has_gpu_backend() {
 
 std::string FrostInterface::get_gpu_backend_name() {
   return get_frost_gpu_backend_info().name;
+}
+
+std::string FrostInterface::get_last_meshing_backend() const {
+  return m_impl->last_meshing_backend;
+}
+
+std::string FrostInterface::get_last_meshing_status() const {
+  return m_impl->last_meshing_status;
+}
+
+bool FrostInterface::get_last_meshing_used_fallback() const {
+  return m_impl->last_meshing_used_fallback;
 }
 
 void FrostInterface::set_particles(const float *positions, size_t count,
@@ -511,6 +584,8 @@ void FrostInterface::generate_mesh(std::vector<float> &vertices,
                                    std::vector<int> &faces) {
   frantic::geometry::trimesh3 outMethod;
   bool gpuSuccess = false;
+  std::string validationError;
+  std::string cpuFallbackReason;
   const bool requiresCpuVertexRefinement =
       m_impl->params.get_vert_refinement_iterations() > 0;
   const bool allowGpuSurfaceMeshing = !requiresCpuVertexRefinement;
@@ -519,6 +594,11 @@ void FrostInterface::generate_mesh(std::vector<float> &vertices,
       m_impl->gpu_surface_refinement <= 0 &&
       m_impl->relax_iterations <= 0 &&
       std::abs(m_impl->push_distance) <= 1e-5f;
+
+  m_impl->last_meshing_backend = "cpu";
+  m_impl->last_meshing_status.clear();
+  m_impl->last_meshing_used_fallback = false;
+
   if (m_impl->enable_gpu && m_impl->gpu_backend &&
       m_impl->gpu_backend->is_available() && allowGpuSurfaceMeshing) {
     FrostGpuMeshingOptions gpuOptions;
@@ -531,32 +611,76 @@ void FrostInterface::generate_mesh(std::vector<float> &vertices,
         m_impl->gpu_backend->generate_mesh_buffers(
             m_impl->particles, m_impl->params, gpuOptions, vertices, faces,
             gpuError)) {
-      if (m_impl->show_debug_log) {
-        std::cout << "[" << m_impl->gpu_backend->name()
-                  << "] Returned raw GPU mesh buffers directly." << std::endl;
+      if (!validate_raw_mesh_buffers(vertices, faces, validationError)) {
+        if (m_impl->show_debug_log) {
+          std::cerr << "[" << m_impl->gpu_backend->name()
+                    << "] Raw GPU mesh buffers failed validation: "
+                    << validationError
+                    << ". Falling back to the safer surface path."
+                    << std::endl;
+        }
+        m_impl->last_meshing_status =
+            "Raw GPU buffers failed validation; using safer GPU surface path.";
+        vertices.clear();
+        faces.clear();
+      } else {
+        m_impl->last_meshing_backend =
+            std::string(m_impl->gpu_backend->name()) + "-raw";
+        m_impl->last_meshing_status =
+            "Direct GPU raw mesh buffers used for the final surface.";
+        m_impl->last_meshing_used_fallback = false;
+        if (m_impl->show_debug_log) {
+          std::cout << "[" << m_impl->gpu_backend->name()
+                    << "] Returned raw GPU mesh buffers directly." << std::endl;
+        }
+        return;
       }
-      return;
     } else if (canBypassTriMeshForGpu && m_impl->show_debug_log &&
                !gpuError.empty()) {
-      std::cerr << "[" << m_impl->gpu_backend->name()
-                << "] Raw GPU buffer path unavailable: " << gpuError
-                << std::endl;
+      if (m_impl->show_debug_log) {
+        std::cerr << "[" << m_impl->gpu_backend->name()
+                  << "] Raw GPU buffer path unavailable: " << gpuError
+                  << std::endl;
+      }
+      m_impl->last_meshing_status = "Raw GPU path unavailable; trying safer GPU "
+                                    "surface extraction.";
     }
 
     gpuSuccess = m_impl->gpu_backend->generate_mesh(
         m_impl->particles, m_impl->params, gpuOptions, outMethod, gpuError);
 
+    if (gpuSuccess) {
+      m_impl->last_meshing_backend = m_impl->gpu_backend->name();
+      if (m_impl->last_meshing_status.empty()) {
+        m_impl->last_meshing_status =
+            "GPU surface extraction completed successfully.";
+      }
+      m_impl->last_meshing_used_fallback = false;
+    }
+
     if (!gpuSuccess && m_impl->show_debug_log && !gpuError.empty()) {
       std::cerr << "[" << m_impl->gpu_backend->name()
                 << "] Falling back to CPU mesher: " << gpuError << std::endl;
     }
+    if (!gpuSuccess && !gpuError.empty()) {
+      cpuFallbackReason = gpuError;
+    }
   } else if (m_impl->enable_gpu && m_impl->gpu_backend &&
              m_impl->gpu_backend->is_available() &&
-             requiresCpuVertexRefinement && m_impl->show_debug_log) {
-    std::cout << "[" << m_impl->gpu_backend->name()
-              << "] Vertex refinement is enabled, so GPU surface extraction "
-                 "is disabled and Frost CPU meshing is used instead."
-              << std::endl;
+             requiresCpuVertexRefinement) {
+    if (m_impl->show_debug_log) {
+      std::cout << "[" << m_impl->gpu_backend->name()
+                << "] Vertex refinement is enabled, so GPU surface extraction "
+                   "is disabled and Frost CPU meshing is used instead."
+                << std::endl;
+    }
+    cpuFallbackReason =
+        "Vertex Refinement requires the CPU surface meshing path.";
+  } else if (m_impl->enable_gpu &&
+             (!m_impl->gpu_backend || !m_impl->gpu_backend->is_available())) {
+    cpuFallbackReason =
+        "GPU acceleration was requested, but no GPU backend is available in "
+        "the current native build.";
   }
 
   frantic::logging::null_progress_logger logger;
@@ -573,6 +697,20 @@ void FrostInterface::generate_mesh(std::vector<float> &vertices,
   if (!gpuSuccess) {
     frost::build_trimesh3(outMethod, particleCount, m_impl->params, stream,
                           logger);
+    if (m_impl->enable_gpu) {
+      m_impl->last_meshing_backend = "cpu-fallback";
+      m_impl->last_meshing_used_fallback = true;
+      if (!cpuFallbackReason.empty()) {
+        m_impl->last_meshing_status = cpuFallbackReason;
+      } else {
+        m_impl->last_meshing_status =
+            "GPU meshing was unavailable, so Frost used the CPU path.";
+      }
+    } else {
+      m_impl->last_meshing_backend = "cpu";
+      m_impl->last_meshing_used_fallback = false;
+      m_impl->last_meshing_status = "CPU meshing path.";
+    }
   }
 
   if (gpuSuccess && m_impl->gpu_surface_refinement > 0) {
@@ -630,4 +768,9 @@ void FrostInterface::generate_mesh(std::vector<float> &vertices,
                         faces_ptr[idx + 2] = (int)f.z;
                       }
                     });
+
+  if (!validate_raw_mesh_buffers(vertices, faces, validationError)) {
+    throw std::runtime_error("generated mesh validation failed: " +
+                             validationError);
+  }
 }

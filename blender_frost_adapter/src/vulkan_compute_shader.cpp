@@ -1300,6 +1300,13 @@ struct SurfaceMeshPushConstants {
   uint32_t padding1 = 0;
 };
 
+struct EdgeDedupPushConstants {
+  uint32_t triangleCount = 0;
+  uint32_t padding0 = 0;
+  uint32_t padding1 = 0;
+  uint32_t padding2 = 0;
+};
+
 std::string build_surface_mesh_compute_shader_source() {
   std::ostringstream shader;
   shader << R"(
@@ -1488,6 +1495,102 @@ void main() {
 )";
   return shader.str();
 }
+
+const char *kEdgeDedupVertexComputeShader = R"(
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform EdgeDedupPushConstants {
+    uint triangleCount;
+    uint _padding0;
+    uint _padding1;
+    uint _padding2;
+} pc;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputTriangleEdgeIds {
+    uint inputTriangleEdgeIds[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer InputTriangleVertices {
+    float inputTriangleVertices[];
+};
+
+layout(std430, set = 0, binding = 2) buffer DenseEdgeToVertexIndex {
+    int denseEdgeToVertexIndex[];
+};
+
+layout(std430, set = 0, binding = 3) buffer GlobalVertexCounter {
+    uint globalVertexCount;
+};
+
+layout(std430, set = 0, binding = 4) writeonly buffer OutputVertices {
+    float outputVertices[];
+};
+
+void main() {
+    uint triangleIndex = gl_GlobalInvocationID.x;
+    if (triangleIndex >= pc.triangleCount) {
+        return;
+    }
+
+    uint edgeBase = triangleIndex * 3u;
+    uint vertexBase = triangleIndex * 9u;
+    for (uint i = 0u; i < 3u; ++i) {
+        uint edgeId = inputTriangleEdgeIds[edgeBase + i];
+        int oldIndex = atomicCompSwap(denseEdgeToVertexIndex[edgeId], -1, -2);
+        if (oldIndex == -1) {
+            uint newVertexIndex = atomicAdd(globalVertexCount, 1u);
+            uint outVertexBase = newVertexIndex * 3u;
+            uint inVertexBase = vertexBase + i * 3u;
+            outputVertices[outVertexBase + 0u] = inputTriangleVertices[inVertexBase + 0u];
+            outputVertices[outVertexBase + 1u] = inputTriangleVertices[inVertexBase + 1u];
+            outputVertices[outVertexBase + 2u] = inputTriangleVertices[inVertexBase + 2u];
+            
+            atomicExchange(denseEdgeToVertexIndex[edgeId], int(newVertexIndex));
+        }
+    }
+}
+)";
+
+const char *kEdgeDedupIndexComputeShader = R"(
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform EdgeDedupPushConstants {
+    uint triangleCount;
+    uint _padding0;
+    uint _padding1;
+    uint _padding2;
+} pc;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputTriangleEdgeIds {
+    uint inputTriangleEdgeIds[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer DenseEdgeToVertexIndex {
+    int denseEdgeToVertexIndex[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer OutputIndices {
+    int outputIndices[];
+};
+
+void main() {
+    uint triangleIndex = gl_GlobalInvocationID.x;
+    if (triangleIndex >= pc.triangleCount) {
+        return;
+    }
+
+    uint edgeBase = triangleIndex * 3u;
+    for (uint i = 0u; i < 3u; ++i) {
+        uint edgeId = inputTriangleEdgeIds[edgeBase + i];
+        int vIdx = denseEdgeToVertexIndex[edgeId];
+        outputIndices[edgeBase + i] = vIdx;
+    }
+}
+)";
 
 std::string build_dense_surface_mesh_compute_shader_source() {
   std::ostringstream shader;
@@ -2319,6 +2422,52 @@ bool compile_surface_triangle_compact_shader_spirv(
   return true;
 }
 
+bool compile_edge_dedup_vertex_shader_spirv(std::vector<uint32_t> &outSpirv,
+                                            std::string &outError) {
+  static std::once_flag initOnce;
+  static bool initOk = false;
+  static std::vector<uint32_t> cachedSpirv;
+  static std::string cachedError;
+
+  std::call_once(initOnce, []() {
+    initOk = compile_compute_shader_source_spirv(
+        kEdgeDedupVertexComputeShader, cachedSpirv, cachedError);
+  });
+
+  if (!initOk || cachedSpirv.empty()) {
+    outError = cachedError.empty() ? "unknown glslang shader compilation error"
+                                   : cachedError;
+    return false;
+  }
+
+  outSpirv = cachedSpirv;
+  outError.clear();
+  return true;
+}
+
+bool compile_edge_dedup_index_shader_spirv(std::vector<uint32_t> &outSpirv,
+                                           std::string &outError) {
+  static std::once_flag initOnce;
+  static bool initOk = false;
+  static std::vector<uint32_t> cachedSpirv;
+  static std::string cachedError;
+
+  std::call_once(initOnce, []() {
+    initOk = compile_compute_shader_source_spirv(
+        kEdgeDedupIndexComputeShader, cachedSpirv, cachedError);
+  });
+
+  if (!initOk || cachedSpirv.empty()) {
+    outError = cachedError.empty() ? "unknown glslang shader compilation error"
+                                   : cachedError;
+    return false;
+  }
+
+  outSpirv = cachedSpirv;
+  outError.clear();
+  return true;
+}
+
 bool find_memory_type_index(const VkPhysicalDeviceMemoryProperties &properties,
                             uint32_t memoryTypeBits,
                             VkMemoryPropertyFlags requiredFlags,
@@ -2755,6 +2904,12 @@ struct VulkanSharedContext {
   VkDescriptorSetLayout denseSurfaceMeshDescriptorSetLayout = VK_NULL_HANDLE;
   VkPipelineLayout denseSurfaceMeshPipelineLayout = VK_NULL_HANDLE;
   VkPipeline denseSurfaceMeshPipeline = VK_NULL_HANDLE;
+  VkDescriptorSetLayout edgeDedupVertexDescriptorSetLayout = VK_NULL_HANDLE;
+  VkPipelineLayout edgeDedupVertexPipelineLayout = VK_NULL_HANDLE;
+  VkPipeline edgeDedupVertexPipeline = VK_NULL_HANDLE;
+  VkDescriptorSetLayout edgeDedupIndexDescriptorSetLayout = VK_NULL_HANDLE;
+  VkPipelineLayout edgeDedupIndexPipelineLayout = VK_NULL_HANDLE;
+  VkPipeline edgeDedupIndexPipeline = VK_NULL_HANDLE;
   VkDescriptorPool computeWorkDescriptorPool = VK_NULL_HANDLE;
   VkDescriptorSet particleDescriptorSet = VK_NULL_HANDLE;
   VkDescriptorSet coverageDescriptorSet = VK_NULL_HANDLE;
@@ -2773,12 +2928,16 @@ struct VulkanSharedContext {
   VkDescriptorSet surfaceTriangleCompactDescriptorSet = VK_NULL_HANDLE;
   VkDescriptorSet surfaceMeshDescriptorSet = VK_NULL_HANDLE;
   VkDescriptorSet denseSurfaceMeshDescriptorSet = VK_NULL_HANDLE;
+  VkDescriptorSet edgeDedupVertexDescriptorSet = VK_NULL_HANDLE;
+  VkDescriptorSet edgeDedupIndexDescriptorSet = VK_NULL_HANDLE;
   VkCommandBuffer surfaceCellCommandBuffer = VK_NULL_HANDLE;
   VkCommandBuffer sparseSurfaceCellCommandBuffer = VK_NULL_HANDLE;
   VkCommandBuffer surfaceCellCompactCommandBuffer = VK_NULL_HANDLE;
   VkCommandBuffer surfaceTriangleCompactCommandBuffer = VK_NULL_HANDLE;
   VkCommandBuffer surfaceMeshCommandBuffer = VK_NULL_HANDLE;
   VkCommandBuffer denseSurfaceMeshCommandBuffer = VK_NULL_HANDLE;
+  VkCommandBuffer edgeDedupVertexCommandBuffer = VK_NULL_HANDLE;
+  VkCommandBuffer edgeDedupIndexCommandBuffer = VK_NULL_HANDLE;
   HostBuffer particleInputBuffer;
   HostBuffer particleOutputBuffer;
   HostBuffer particleVelocityBuffer;
@@ -2798,6 +2957,11 @@ struct VulkanSharedContext {
   HostBuffer surfaceCellStatsBuffer;
   HostBuffer surfaceTriangleCountBuffer;
   HostBuffer surfaceTriangleVertexBuffer;
+  HostBuffer surfaceTriangleEdgeIdBuffer;
+  HostBuffer denseEdgeToVertexIndexBuffer;
+  HostBuffer globalVertexCountBuffer;
+  HostBuffer surfaceMeshVertexBuffer;
+  HostBuffer surfaceMeshIndexBuffer;
   bool residentSurfaceTriangleVerticesCompacted = false;
   DeviceBuffer deviceActiveVoxelCompactLookupBuffer;
   DeviceBuffer deviceActiveVoxelParticleOffsetBuffer;
@@ -2809,6 +2973,11 @@ struct VulkanSharedContext {
   DeviceBuffer deviceSurfaceCellStatsBuffer;
   DeviceBuffer deviceSurfaceTriangleCountBuffer;
   DeviceBuffer deviceSurfaceTriangleVertexBuffer;
+  DeviceBuffer deviceSurfaceTriangleEdgeIdBuffer;
+  DeviceBuffer deviceDenseEdgeToVertexIndexBuffer;
+  DeviceBuffer deviceGlobalVertexCountBuffer;
+  DeviceBuffer deviceSurfaceMeshVertexBuffer;
+  DeviceBuffer deviceSurfaceMeshIndexBuffer;
 
   PFN_vkDestroyInstance vkDestroyInstance = nullptr;
   PFN_vkDestroyDevice vkDestroyDevice = nullptr;
@@ -2899,10 +3068,18 @@ struct VulkanSharedContext {
       release_host_buffer(denseSurfaceCellCubeIndexBuffer);
       release_host_buffer(surfaceTriangleVertexBuffer);
       release_host_buffer(surfaceTriangleCountBuffer);
+      release_host_buffer(denseEdgeToVertexIndexBuffer);
+      release_host_buffer(globalVertexCountBuffer);
+      release_host_buffer(surfaceMeshVertexBuffer);
+      release_host_buffer(surfaceMeshIndexBuffer);
       release_device_buffer(deviceSurfaceTriangleVertexBuffer);
       release_device_buffer(deviceSurfaceTriangleCountBuffer);
       release_device_buffer(deviceSurfaceCellStatsBuffer);
       release_device_buffer(deviceDenseSurfaceCellCubeIndexBuffer);
+      release_device_buffer(deviceDenseEdgeToVertexIndexBuffer);
+      release_device_buffer(deviceGlobalVertexCountBuffer);
+      release_device_buffer(deviceSurfaceMeshVertexBuffer);
+      release_device_buffer(deviceSurfaceMeshIndexBuffer);
       release_device_buffer(deviceCandidateCellCubeIndexBuffer);
       release_device_buffer(deviceCandidateCellIndexBuffer);
       release_device_buffer(deviceActiveVoxelParticleIndexBuffer);
@@ -2953,6 +3130,12 @@ struct VulkanSharedContext {
       if (denseSurfaceMeshPipeline != VK_NULL_HANDLE && vkDestroyPipeline) {
         vkDestroyPipeline(device, denseSurfaceMeshPipeline, nullptr);
       }
+      if (edgeDedupVertexPipeline != VK_NULL_HANDLE && vkDestroyPipeline) {
+        vkDestroyPipeline(device, edgeDedupVertexPipeline, nullptr);
+      }
+      if (edgeDedupIndexPipeline != VK_NULL_HANDLE && vkDestroyPipeline) {
+        vkDestroyPipeline(device, edgeDedupIndexPipeline, nullptr);
+      }
       if (particlePipelineLayout != VK_NULL_HANDLE && vkDestroyPipelineLayout) {
         vkDestroyPipelineLayout(device, particlePipelineLayout, nullptr);
       }
@@ -2999,6 +3182,14 @@ struct VulkanSharedContext {
       if (denseSurfaceMeshPipelineLayout != VK_NULL_HANDLE &&
           vkDestroyPipelineLayout) {
         vkDestroyPipelineLayout(device, denseSurfaceMeshPipelineLayout, nullptr);
+      }
+      if (edgeDedupVertexPipelineLayout != VK_NULL_HANDLE &&
+          vkDestroyPipelineLayout) {
+        vkDestroyPipelineLayout(device, edgeDedupVertexPipelineLayout, nullptr);
+      }
+      if (edgeDedupIndexPipelineLayout != VK_NULL_HANDLE &&
+          vkDestroyPipelineLayout) {
+        vkDestroyPipelineLayout(device, edgeDedupIndexPipelineLayout, nullptr);
       }
       if (particleDescriptorSetLayout != VK_NULL_HANDLE &&
           vkDestroyDescriptorSetLayout) {
@@ -3059,6 +3250,18 @@ struct VulkanSharedContext {
           vkDestroyDescriptorSetLayout) {
         vkDestroyDescriptorSetLayout(device,
                                      denseSurfaceMeshDescriptorSetLayout,
+                                     nullptr);
+      }
+      if (edgeDedupVertexDescriptorSetLayout != VK_NULL_HANDLE &&
+          vkDestroyDescriptorSetLayout) {
+        vkDestroyDescriptorSetLayout(device,
+                                     edgeDedupVertexDescriptorSetLayout,
+                                     nullptr);
+      }
+      if (edgeDedupIndexDescriptorSetLayout != VK_NULL_HANDLE &&
+          vkDestroyDescriptorSetLayout) {
+        vkDestroyDescriptorSetLayout(device,
+                                     edgeDedupIndexDescriptorSetLayout,
                                      nullptr);
       }
       if (surfaceWorkDescriptorPool != VK_NULL_HANDLE &&
@@ -3658,7 +3861,7 @@ bool initialize_vulkan_shared_context(VulkanSharedContext &context,
 
       VkDescriptorPoolCreateInfo poolInfo{};
       poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-      poolInfo.maxSets = 6;
+      poolInfo.maxSets = 8;
       poolInfo.poolSizeCount = 1;
       poolInfo.pPoolSizes = &poolSize;
       if (context.vkCreateDescriptorPool(context.device, &poolInfo, nullptr,
@@ -3675,20 +3878,24 @@ bool initialize_vulkan_shared_context(VulkanSharedContext &context,
         context.surfaceCellCompactDescriptorSet == VK_NULL_HANDLE ||
         context.surfaceTriangleCompactDescriptorSet == VK_NULL_HANDLE ||
         context.surfaceMeshDescriptorSet == VK_NULL_HANDLE ||
-        context.denseSurfaceMeshDescriptorSet == VK_NULL_HANDLE) {
-      VkDescriptorSetLayout layouts[6] = {
+        context.denseSurfaceMeshDescriptorSet == VK_NULL_HANDLE ||
+        context.edgeDedupVertexDescriptorSet == VK_NULL_HANDLE ||
+        context.edgeDedupIndexDescriptorSet == VK_NULL_HANDLE) {
+      VkDescriptorSetLayout layouts[8] = {
           context.surfaceCellDescriptorSetLayout,
           context.sparseSurfaceCellDescriptorSetLayout,
           context.surfaceCellCompactDescriptorSetLayout,
           context.surfaceTriangleCompactDescriptorSetLayout,
           context.surfaceMeshDescriptorSetLayout,
           context.denseSurfaceMeshDescriptorSetLayout,
+          context.edgeDedupVertexDescriptorSetLayout,
+          context.edgeDedupIndexDescriptorSetLayout,
       };
-      VkDescriptorSet sets[6] = {};
+      VkDescriptorSet sets[8] = {};
       VkDescriptorSetAllocateInfo setAllocateInfo{};
       setAllocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
       setAllocateInfo.descriptorPool = context.surfaceWorkDescriptorPool;
-      setAllocateInfo.descriptorSetCount = 6;
+      setAllocateInfo.descriptorSetCount = 8;
       setAllocateInfo.pSetLayouts = layouts;
       if (context.vkAllocateDescriptorSets(context.device, &setAllocateInfo,
                                            sets) != VK_SUCCESS) {
@@ -3702,6 +3909,8 @@ bool initialize_vulkan_shared_context(VulkanSharedContext &context,
       context.surfaceTriangleCompactDescriptorSet = sets[3];
       context.surfaceMeshDescriptorSet = sets[4];
       context.denseSurfaceMeshDescriptorSet = sets[5];
+      context.edgeDedupVertexDescriptorSet = sets[6];
+      context.edgeDedupIndexDescriptorSet = sets[7];
     }
 
     if (context.surfaceCellCommandBuffer == VK_NULL_HANDLE ||
@@ -3709,15 +3918,17 @@ bool initialize_vulkan_shared_context(VulkanSharedContext &context,
         context.surfaceCellCompactCommandBuffer == VK_NULL_HANDLE ||
         context.surfaceTriangleCompactCommandBuffer == VK_NULL_HANDLE ||
         context.surfaceMeshCommandBuffer == VK_NULL_HANDLE ||
-        context.denseSurfaceMeshCommandBuffer == VK_NULL_HANDLE) {
+        context.denseSurfaceMeshCommandBuffer == VK_NULL_HANDLE ||
+        context.edgeDedupVertexCommandBuffer == VK_NULL_HANDLE ||
+        context.edgeDedupIndexCommandBuffer == VK_NULL_HANDLE) {
       VkCommandBufferAllocateInfo commandBufferAllocateInfo{};
       commandBufferAllocateInfo.sType =
           VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
       commandBufferAllocateInfo.commandPool = context.commandPool;
       commandBufferAllocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-      commandBufferAllocateInfo.commandBufferCount = 6;
+      commandBufferAllocateInfo.commandBufferCount = 8;
 
-      VkCommandBuffer commandBuffers[6] = {};
+      VkCommandBuffer commandBuffers[8] = {};
       if (context.vkAllocateCommandBuffers(context.device,
                                            &commandBufferAllocateInfo,
                                            commandBuffers) != VK_SUCCESS) {
@@ -3731,6 +3942,8 @@ bool initialize_vulkan_shared_context(VulkanSharedContext &context,
       context.surfaceTriangleCompactCommandBuffer = commandBuffers[3];
       context.surfaceMeshCommandBuffer = commandBuffers[4];
       context.denseSurfaceMeshCommandBuffer = commandBuffers[5];
+      context.edgeDedupVertexCommandBuffer = commandBuffers[6];
+      context.edgeDedupIndexCommandBuffer = commandBuffers[7];
     }
 
     resourceError.clear();
@@ -4137,6 +4350,8 @@ bool initialize_vulkan_shared_context(VulkanSharedContext &context,
   std::vector<uint32_t> surfaceTriangleCompactShaderSpirv;
   std::vector<uint32_t> surfaceMeshShaderSpirv;
   std::vector<uint32_t> denseSurfaceMeshShaderSpirv;
+  std::vector<uint32_t> edgeDedupVertexShaderSpirv;
+  std::vector<uint32_t> edgeDedupIndexShaderSpirv;
   if (!compile_compute_shader_spirv(particleShaderSpirv, outError) ||
       !compile_voxel_coverage_shader_spirv(coverageShaderSpirv, outError) ||
       !compile_active_voxel_compact_shader_spirv(
@@ -4162,7 +4377,11 @@ bool initialize_vulkan_shared_context(VulkanSharedContext &context,
                                          outError) ||
       !compile_compute_shader_source_spirv(
           build_dense_surface_mesh_compute_shader_source().c_str(),
-          denseSurfaceMeshShaderSpirv, outError)) {
+          denseSurfaceMeshShaderSpirv, outError) ||
+      !compile_edge_dedup_vertex_shader_spirv(
+          edgeDedupVertexShaderSpirv, outError) ||
+      !compile_edge_dedup_index_shader_spirv(
+          edgeDedupIndexShaderSpirv, outError)) {
     return fail(outError);
   }
 
@@ -4383,6 +4602,42 @@ bool initialize_vulkan_shared_context(VulkanSharedContext &context,
   denseSurfaceMeshBindings[3].descriptorCount = 1;
   denseSurfaceMeshBindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+  VkDescriptorSetLayoutBinding edgeDedupVertexBindings[5]{};
+  edgeDedupVertexBindings[0].binding = 0;
+  edgeDedupVertexBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  edgeDedupVertexBindings[0].descriptorCount = 1;
+  edgeDedupVertexBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  edgeDedupVertexBindings[1].binding = 1;
+  edgeDedupVertexBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  edgeDedupVertexBindings[1].descriptorCount = 1;
+  edgeDedupVertexBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  edgeDedupVertexBindings[2].binding = 2;
+  edgeDedupVertexBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  edgeDedupVertexBindings[2].descriptorCount = 1;
+  edgeDedupVertexBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  edgeDedupVertexBindings[3].binding = 3;
+  edgeDedupVertexBindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  edgeDedupVertexBindings[3].descriptorCount = 1;
+  edgeDedupVertexBindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  edgeDedupVertexBindings[4].binding = 4;
+  edgeDedupVertexBindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  edgeDedupVertexBindings[4].descriptorCount = 1;
+  edgeDedupVertexBindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+  VkDescriptorSetLayoutBinding edgeDedupIndexBindings[3]{};
+  edgeDedupIndexBindings[0].binding = 0;
+  edgeDedupIndexBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  edgeDedupIndexBindings[0].descriptorCount = 1;
+  edgeDedupIndexBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  edgeDedupIndexBindings[1].binding = 1;
+  edgeDedupIndexBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  edgeDedupIndexBindings[1].descriptorCount = 1;
+  edgeDedupIndexBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  edgeDedupIndexBindings[2].binding = 2;
+  edgeDedupIndexBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  edgeDedupIndexBindings[2].descriptorCount = 1;
+  edgeDedupIndexBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
   if (!create_shared_compute_pipeline(
           particleBindings, 5, sizeof(PushConstants), particleShaderSpirv,
           context.particleDescriptorSetLayout, context.particlePipelineLayout,
@@ -4456,7 +4711,21 @@ bool initialize_vulkan_shared_context(VulkanSharedContext &context,
           context.denseSurfaceMeshDescriptorSetLayout,
           context.denseSurfaceMeshPipelineLayout,
           context.denseSurfaceMeshPipeline,
-          "surface-mesh pipeline")) {
+          "surface-mesh pipeline") ||
+      !create_shared_compute_pipeline(
+          edgeDedupVertexBindings, 5, sizeof(EdgeDedupPushConstants),
+          edgeDedupVertexShaderSpirv,
+          context.edgeDedupVertexDescriptorSetLayout,
+          context.edgeDedupVertexPipelineLayout,
+          context.edgeDedupVertexPipeline,
+          "edge-dedup-vertex pipeline") ||
+      !create_shared_compute_pipeline(
+          edgeDedupIndexBindings, 3, sizeof(EdgeDedupPushConstants),
+          edgeDedupIndexShaderSpirv,
+          context.edgeDedupIndexDescriptorSetLayout,
+          context.edgeDedupIndexPipelineLayout,
+          context.edgeDedupIndexPipeline,
+          "edge-dedup-index pipeline")) {
     return fail(outError);
   }
 
@@ -7807,6 +8076,300 @@ bool get_frost_vulkan_resident_compact_surface_vertex_view(
   outTriangleVertices = reinterpret_cast<const float *>(
       sharedContext.surfaceTriangleVertexBuffer.mapped);
   outError.clear();
+  return true;
+}
+
+bool get_frost_vulkan_resident_compact_surface_edge_id_view(
+    uint32_t totalTriangleCount, const uint32_t *&outTriangleEdgeIds,
+    std::string &outError) {
+  outTriangleEdgeIds = nullptr;
+  if (totalTriangleCount == 0u) {
+    outError.clear();
+    return true;
+  }
+
+  auto &sharedContext = get_vulkan_shared_context();
+  std::lock_guard<std::mutex> lock(sharedContext.mutex);
+  if (!initialize_vulkan_shared_context(sharedContext, outError)) {
+    return false;
+  }
+
+  if (sharedContext.surfaceTriangleEdgeIdBuffer.mapped == nullptr ||
+      !sharedContext.residentSurfaceTriangleVerticesCompacted) {
+    outError = "Vulkan compact resident surface edge-id buffer is unavailable.";
+    return false;
+  }
+
+  outTriangleEdgeIds = reinterpret_cast<const uint32_t *>(
+      sharedContext.surfaceTriangleEdgeIdBuffer.mapped);
+  outError.clear();
+  return true;
+}
+
+bool run_frost_vulkan_generate_deduplicated_surface_mesh(
+    uint32_t totalTriangleCount, uint32_t totalEdgeCount,
+    std::vector<float> &outVertices, std::vector<int> &outFaces,
+    std::string &outError) {
+  outVertices.clear();
+  outFaces.clear();
+
+  if (totalTriangleCount == 0u || totalEdgeCount == 0u) {
+    outError.clear();
+    return true;
+  }
+
+  auto &sharedContext = get_vulkan_shared_context();
+  std::lock_guard<std::mutex> lock(sharedContext.mutex);
+  if (!initialize_vulkan_shared_context(sharedContext, outError)) {
+    return false;
+  }
+
+  VkDevice device = sharedContext.device;
+  VkQueue queue = sharedContext.queue;
+  VkCommandPool commandPool = sharedContext.commandPool;
+  auto vkUpdateDescriptorSets = sharedContext.vkUpdateDescriptorSets;
+  auto vkBeginCommandBuffer = sharedContext.vkBeginCommandBuffer;
+  auto vkCmdBindPipeline = sharedContext.vkCmdBindPipeline;
+  auto vkCmdBindDescriptorSets = sharedContext.vkCmdBindDescriptorSets;
+  auto vkCmdPushConstants = sharedContext.vkCmdPushConstants;
+  auto vkCmdDispatch = sharedContext.vkCmdDispatch;
+  auto vkCmdPipelineBarrier = sharedContext.vkCmdPipelineBarrier;
+  auto vkEndCommandBuffer = sharedContext.vkEndCommandBuffer;
+  auto vkQueueSubmit = sharedContext.vkQueueSubmit;
+  auto vkQueueWaitIdle = sharedContext.vkQueueWaitIdle;
+  auto vkResetCommandPool = sharedContext.vkResetCommandPool;
+  auto vkCmdFillBuffer = sharedContext.vkCmdFillBuffer;
+
+  auto cleanup = [&]() {
+    if (device != VK_NULL_HANDLE) {
+      if (queue != VK_NULL_HANDLE && vkQueueWaitIdle) {
+        vkQueueWaitIdle(queue);
+      }
+      if (commandPool != VK_NULL_HANDLE && vkResetCommandPool) {
+        vkResetCommandPool(device, commandPool, 0);
+      }
+    }
+  };
+
+  const VkDeviceSize vertexMemorySize =
+      static_cast<VkDeviceSize>(totalTriangleCount * 9ull * sizeof(float));
+  const VkDeviceSize edgeMappingMemorySize =
+      static_cast<VkDeviceSize>(totalEdgeCount * sizeof(uint32_t));
+  const VkDeviceSize globalCounterSize = sizeof(uint32_t);
+  const VkDeviceSize indexMemorySize =
+      static_cast<VkDeviceSize>(totalTriangleCount * 3ull * sizeof(uint32_t));
+
+  if (sharedContext.surfaceTriangleEdgeIdBuffer.buffer == VK_NULL_HANDLE ||
+      sharedContext.surfaceTriangleVertexBuffer.buffer == VK_NULL_HANDLE ||
+      !sharedContext.residentSurfaceTriangleVerticesCompacted) {
+    outError =
+        "Vulkan GPU edge deduplication requires the resident compact surface "
+        "triangle buffers.";
+    cleanup();
+    return false;
+  }
+
+  bool buffersReady = ensure_shared_host_buffer(
+      sharedContext, sharedContext.surfaceMeshVertexBuffer, vertexMemorySize,
+      "surface mesh vertex buffer", outError);
+  if (buffersReady) {
+    buffersReady = ensure_shared_host_buffer(
+        sharedContext, sharedContext.denseEdgeToVertexIndexBuffer,
+        edgeMappingMemorySize, "dense edge-to-vertex index buffer", outError);
+  }
+  if (buffersReady) {
+    buffersReady = ensure_shared_host_buffer(
+        sharedContext, sharedContext.globalVertexCountBuffer, globalCounterSize,
+        "global vertex count buffer", outError);
+  }
+  if (buffersReady) {
+    buffersReady = ensure_shared_host_buffer(
+        sharedContext, sharedContext.surfaceMeshIndexBuffer, indexMemorySize,
+        "surface mesh index buffer", outError);
+  }
+  if (!buffersReady) {
+    cleanup();
+    return false;
+  }
+
+  if (sharedContext.edgeDedupVertexDescriptorSetLayout == VK_NULL_HANDLE ||
+      sharedContext.edgeDedupVertexPipelineLayout == VK_NULL_HANDLE ||
+      sharedContext.edgeDedupVertexPipeline == VK_NULL_HANDLE ||
+      sharedContext.edgeDedupVertexDescriptorSet == VK_NULL_HANDLE ||
+      sharedContext.edgeDedupVertexCommandBuffer == VK_NULL_HANDLE) {
+    outError = "Vulkan GPU edge-dedup-vertex pipeline is unavailable.";
+    cleanup();
+    return false;
+  }
+
+  if (sharedContext.edgeDedupIndexDescriptorSetLayout == VK_NULL_HANDLE ||
+      sharedContext.edgeDedupIndexPipelineLayout == VK_NULL_HANDLE ||
+      sharedContext.edgeDedupIndexPipeline == VK_NULL_HANDLE ||
+      sharedContext.edgeDedupIndexDescriptorSet == VK_NULL_HANDLE ||
+      sharedContext.edgeDedupIndexCommandBuffer == VK_NULL_HANDLE) {
+    outError = "Vulkan GPU edge-dedup-index pipeline is unavailable.";
+    cleanup();
+    return false;
+  }
+
+  // Clear tracking map and counter
+  std::memset(sharedContext.denseEdgeToVertexIndexBuffer.mapped, 0xFF,
+              static_cast<size_t>(edgeMappingMemorySize));
+  std::memset(sharedContext.globalVertexCountBuffer.mapped, 0,
+              static_cast<size_t>(globalCounterSize));
+
+  // 1. Dispatch Vertex Emit Pass
+  VkDescriptorBufferInfo vertexPassInfos[5]{};
+  vertexPassInfos[0].buffer = sharedContext.surfaceTriangleEdgeIdBuffer.buffer;
+  vertexPassInfos[0].offset = 0;
+  vertexPassInfos[0].range = VK_WHOLE_SIZE;
+  vertexPassInfos[1].buffer = sharedContext.surfaceTriangleVertexBuffer.buffer;
+  vertexPassInfos[1].offset = 0;
+  vertexPassInfos[1].range = VK_WHOLE_SIZE;
+  vertexPassInfos[2].buffer = sharedContext.surfaceMeshVertexBuffer.buffer;
+  vertexPassInfos[2].offset = 0;
+  vertexPassInfos[2].range = vertexMemorySize;
+  vertexPassInfos[3].buffer = sharedContext.denseEdgeToVertexIndexBuffer.buffer;
+  vertexPassInfos[3].offset = 0;
+  vertexPassInfos[3].range = edgeMappingMemorySize;
+  vertexPassInfos[4].buffer = sharedContext.globalVertexCountBuffer.buffer;
+  vertexPassInfos[4].offset = 0;
+  vertexPassInfos[4].range = globalCounterSize;
+
+  VkWriteDescriptorSet vertexWrites[5]{};
+  for (uint32_t i = 0; i < 5; ++i) {
+    vertexWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    vertexWrites[i].dstSet = sharedContext.edgeDedupVertexDescriptorSet;
+    vertexWrites[i].dstBinding = i;
+    vertexWrites[i].descriptorCount = 1;
+    vertexWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    vertexWrites[i].pBufferInfo = &vertexPassInfos[i];
+  }
+  vkUpdateDescriptorSets(device, 5, vertexWrites, 0, nullptr);
+
+  // 2. Dispatch Index Format Pass
+  VkDescriptorBufferInfo indexPassInfos[3]{};
+  indexPassInfos[0].buffer = sharedContext.surfaceTriangleEdgeIdBuffer.buffer;
+  indexPassInfos[0].offset = 0;
+  indexPassInfos[0].range = VK_WHOLE_SIZE;
+  indexPassInfos[1].buffer = sharedContext.denseEdgeToVertexIndexBuffer.buffer;
+  indexPassInfos[1].offset = 0;
+  indexPassInfos[1].range = edgeMappingMemorySize;
+  indexPassInfos[2].buffer = sharedContext.surfaceMeshIndexBuffer.buffer;
+  indexPassInfos[2].offset = 0;
+  indexPassInfos[2].range = indexMemorySize;
+
+  VkWriteDescriptorSet indexWrites[3]{};
+  for (uint32_t i = 0; i < 3; ++i) {
+    indexWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    indexWrites[i].dstSet = sharedContext.edgeDedupIndexDescriptorSet;
+    indexWrites[i].dstBinding = i;
+    indexWrites[i].descriptorCount = 1;
+    indexWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    indexWrites[i].pBufferInfo = &indexPassInfos[i];
+  }
+  vkUpdateDescriptorSets(device, 3, indexWrites, 0, nullptr);
+
+  VkCommandBuffer vertexCmd = sharedContext.edgeDedupVertexCommandBuffer;
+  VkCommandBufferBeginInfo beginInfo{};
+  beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  if (vkBeginCommandBuffer(vertexCmd, &beginInfo) != VK_SUCCESS) {
+    outError = "Failed to begin Vulkan edge deduplication command buffer.";
+    cleanup();
+    return false;
+  }
+
+  EdgeDedupPushConstants pushConstants{};
+  pushConstants.triangleCount = totalTriangleCount;
+
+  // ==== PASS 1: Vertex Extract ====
+  vkCmdBindPipeline(vertexCmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    sharedContext.edgeDedupVertexPipeline);
+  vkCmdBindDescriptorSets(vertexCmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          sharedContext.edgeDedupVertexPipelineLayout, 0, 1,
+                          &sharedContext.edgeDedupVertexDescriptorSet, 0,
+                          nullptr);
+  vkCmdPushConstants(vertexCmd, sharedContext.edgeDedupVertexPipelineLayout,
+                     VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                     sizeof(EdgeDedupPushConstants), &pushConstants);
+
+  const uint32_t edgeWorkgroupCount =
+      static_cast<uint32_t>((totalTriangleCount * 3u + 63u) / 64u);
+  vkCmdDispatch(vertexCmd, edgeWorkgroupCount, 1, 1);
+
+  // ==== BARRIER ====
+  VkMemoryBarrier barrier{};
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  vkCmdPipelineBarrier(vertexCmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0,
+                       nullptr, 0, nullptr);
+
+  // ==== PASS 2: Index Generate ====
+  vkCmdBindPipeline(vertexCmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    sharedContext.edgeDedupIndexPipeline);
+  vkCmdBindDescriptorSets(vertexCmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          sharedContext.edgeDedupIndexPipelineLayout, 0, 1,
+                          &sharedContext.edgeDedupIndexDescriptorSet, 0,
+                          nullptr);
+  vkCmdPushConstants(vertexCmd, sharedContext.edgeDedupIndexPipelineLayout,
+                     VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                     sizeof(EdgeDedupPushConstants), &pushConstants);
+
+  const uint32_t indexWorkgroupCount =
+      static_cast<uint32_t>((totalTriangleCount + 63u) / 64u);
+  vkCmdDispatch(vertexCmd, indexWorkgroupCount, 1, 1);
+
+  // ==== BARRIER FOR CPU TRANSFER ====
+  VkMemoryBarrier hostBarrier{};
+  hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  vkCmdPipelineBarrier(vertexCmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hostBarrier, 0,
+                       nullptr, 0, nullptr);
+
+  if (vkEndCommandBuffer(vertexCmd) != VK_SUCCESS) {
+    outError = "Failed to end Vulkan edge deduplication command buffer.";
+    cleanup();
+    return false;
+  }
+
+  // Submit and wait for execution to complete
+  VkSubmitInfo submitInfo{};
+  submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submitInfo.commandBufferCount = 1;
+  submitInfo.pCommandBuffers = &vertexCmd;
+  if (vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS ||
+      vkQueueWaitIdle(queue) != VK_SUCCESS) {
+    outError = "Failed to submit Vulkan edge deduplication pass.";
+    cleanup();
+    return false;
+  }
+
+  // Read back outputs
+  const uint32_t finalVertexCount =
+      *reinterpret_cast<const uint32_t *>(
+          sharedContext.globalVertexCountBuffer.mapped);
+  
+  if (finalVertexCount == 0 ||
+      finalVertexCount > static_cast<uint32_t>(totalTriangleCount * 3ull)) {
+    outError = "GPU edge deduplication generated an invalid vertex count.";
+    cleanup();
+    return false;
+  }
+
+  const float *gpuVertices = reinterpret_cast<const float *>(
+      sharedContext.surfaceMeshVertexBuffer.mapped);
+  outVertices.assign(gpuVertices, gpuVertices + static_cast<size_t>(finalVertexCount * 3u));
+
+  const int *gpuIndices = reinterpret_cast<const int *>(
+      sharedContext.surfaceMeshIndexBuffer.mapped);
+  outFaces.assign(gpuIndices, gpuIndices + static_cast<size_t>(totalTriangleCount * 3u));
+
+  outError.clear();
+  cleanup();
   return true;
 }
 

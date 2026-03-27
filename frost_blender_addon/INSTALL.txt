@@ -1,13 +1,13 @@
-Frost Particle Meshing for Blender
+Frost for Blender v1.25.0
 
 Installation:
 1. Open Blender 5+
 2. Go to Edit > Preferences > Add-ons
-3. Open the add-on menu and choose Install from Disk...
+3. Choose Install from Disk...
 4. Select the release zip from GitHub Releases
 5. Enable "Frost Particle Meshing"
 
 Notes:
 - This package uses frost_native.dll through native_bridge.py.
 - Restart Blender after replacing the addon files or updating the native DLL.
-- The current public package targets the CPU path and the experimental Vulkan backend in one addon.
+- The current public package includes the CPU path and the in-progress Vulkan backend in one addon.

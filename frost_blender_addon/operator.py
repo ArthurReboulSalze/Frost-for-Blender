@@ -36,6 +36,8 @@ except Exception as e:
 
 import gc
 
+_updates_in_progress = set()
+
 
 def has_native_backend():
     return blender_frost_adapter is not None
@@ -108,12 +110,74 @@ def clear_frost_cache(obj_id=None):
     else:
         _frost_cache.clear()
 
+
+def _trim_status_message(message, max_chars=160):
+    message = (message or "").strip()
+    if len(message) <= max_chars:
+        return message
+    return message[: max_chars - 3].rstrip() + "..."
+
+
+def record_meshing_status(frost_props, gpu_requested, meshing_info):
+    backend = str(meshing_info.get("backend", "") or "")
+    status = _trim_status_message(meshing_info.get("status", "") or "")
+    used_fallback = bool(meshing_info.get("used_fallback", False))
+
+    if not backend:
+        backend = "cpu-fallback" if used_fallback else "cpu"
+    if not status:
+        if used_fallback:
+            status = "GPU meshing was requested, but Frost used the CPU fallback path."
+        elif backend.startswith("vulkan") or backend.startswith("cuda"):
+            status = "GPU meshing path used successfully."
+        else:
+            status = "CPU meshing path used."
+
+    frost_props.last_meshing_backend = backend
+    frost_props.last_meshing_status = status
+    frost_props.last_meshing_used_fallback = used_fallback
+    frost_props.last_meshing_had_gpu_request = bool(gpu_requested)
+    frost_props.last_meshing_timestamp = time.time()
+
 def unload_adapter():
     """Explicitly release the C++ adapter to prevent shutdown crashes."""
     global blender_frost_adapter, _frost_cache
     _frost_cache.clear()
     blender_frost_adapter = None
     gc.collect()
+
+
+def validate_mesh_arrays(vertices, faces):
+    """Validate mesh buffers before they are sent to Blender."""
+    if vertices is None or faces is None:
+        return False, "missing mesh buffers"
+
+    vertices = np.asarray(vertices)
+    faces = np.asarray(faces)
+
+    if vertices.ndim != 2 or vertices.shape[1] != 3:
+        return False, f"invalid vertex array shape {vertices.shape}"
+    if faces.ndim != 2 or faces.shape[1] != 3:
+        return False, f"invalid face array shape {faces.shape}"
+
+    if len(vertices) == 0 and len(faces) == 0:
+        return True, ""
+    if len(vertices) == 0 or len(faces) == 0:
+        return False, "mesh buffers contain vertices or faces, but not both"
+
+    if not np.isfinite(vertices).all():
+        return False, "vertex array contains non-finite coordinates"
+    if np.issubdtype(faces.dtype, np.integer) is False:
+        return False, f"invalid face dtype {faces.dtype}"
+    if (faces < 0).any():
+        return False, "face array contains negative vertex indices"
+    max_face_index = int(np.max(faces)) if faces.size else -1
+    if max_face_index >= len(vertices):
+        return False, "face array contains out-of-range vertex indices"
+    if np.any(faces[:, 0] == faces[:, 1]) or np.any(faces[:, 1] == faces[:, 2]) or np.any(faces[:, 0] == faces[:, 2]):
+        return False, "face array contains degenerate triangles"
+
+    return True, ""
 
 
 def get_particle_data(obj, context, frost_props):
@@ -194,217 +258,239 @@ def update_frost_mesh(obj, context):
         print("Frost C++ adapter not loaded.")
         return
 
+    obj_id = id(obj)
+    if obj_id in _updates_in_progress:
+        return
+
     # Smart Optimization: Skip updates if hidden in viewport
     if obj.hide_viewport:
         return
 
     frost_props = obj.frost_properties
     
-    start_time = time.time()
-    
-    # Extract particles
+    _updates_in_progress.add(obj_id)
     try:
-        positions, radii, velocities = get_particle_data(obj, context, frost_props)
-    except Exception as e:
-        print(f"Frost Warning: {e}")
-        return
+        start_time = time.time()
+        
+        # Extract particles
+        try:
+            positions, radii, velocities = get_particle_data(obj, context, frost_props)
+        except Exception as e:
+            print(f"Frost Warning: {e}")
+            return
 
-    if len(positions) == 0:
-        return # Nothing to mesh
-    
-    # Safety Check: Particle Count Limit
-    # Very large particle counts combined with fine voxel resolution can crash TBB allocator
-    MAX_SAFE_PARTICLES = 500000  # Conservative limit to prevent memory crashes
-    particle_count = len(positions)
-    
-    if particle_count > MAX_SAFE_PARTICLES:
-        print(f"Frost Warning: Skipping meshing - {particle_count} particles exceeds safe limit of {MAX_SAFE_PARTICLES}.")
-        print(f"  -> Reduce particle count or increase Voxel Length to prevent crashes.")
-        return
-    
-    # Safety Check: Estimate Voxel Grid Size
-    # Grid size ~ (bounding_box / voxel_size)^3
-    # If this is too large, skip to avoid memory exhaustion
-    if particle_count > 10000:  # Only check for larger counts
-        min_bound = np.min(positions, axis=0)
-        max_bound = np.max(positions, axis=0)
-        bbox_size = max_bound - min_bound
+        if len(positions) == 0:
+            return # Nothing to mesh
         
-        voxel_size = frost_props.meshing_voxel_length
-        if voxel_size < 0.01:  # Very fine resolution
-            estimated_voxels = np.prod(bbox_size / max(voxel_size, 0.001))
-            if estimated_voxels > 500_000_000:  # 500M voxels is dangerous
-                print(f"Frost Warning: Skipping meshing - Estimated voxel count ({estimated_voxels:.0f}) too large.")
-                print(f"  -> Increase Voxel Length to prevent crashes.")
-                return
-
-    # Initialize Frost - use cached instance for performance
-    try:
-        # Get or create cached FrostInterface (avoids recreation overhead)
-        frost = get_cached_frost(id(obj))
-        gpu_backend_available = has_gpu_backend()
-        gpu_backend_name = get_gpu_backend_name()
-        if frost_props.use_gpu and not gpu_backend_available and frost_props.show_debug_log:
-            print(f"Frost: no GPU backend is available in the current native build ({gpu_backend_name}), falling back to CPU.")
+        # Safety Check: Particle Count Limit
+        # Very large particle counts combined with fine voxel resolution can crash TBB allocator
+        MAX_SAFE_PARTICLES = 500000  # Conservative limit to prevent memory crashes
+        particle_count = len(positions)
         
-        # Transform World Space Particles -> Local Space of Frost Object
-        # Extracted particles are in World Space.
-        # But we are writing to obj.data (Mesh). 
-        # Blender applies obj.matrix_world to the mesh.
-        # So: FinalPos = ObjMatrix * VertexPos
-        # We want FinalPos == WorldSpaceParticle
-        # Therefore: VertexPos = Inverse(ObjMatrix) * WorldSpaceParticle
+        if particle_count > MAX_SAFE_PARTICLES:
+            print(f"Frost Warning: Skipping meshing - {particle_count} particles exceeds safe limit of {MAX_SAFE_PARTICLES}.")
+            print(f"  -> Reduce particle count or increase Voxel Length to prevent crashes.")
+            return
         
-        matrix_inv = np.array(obj.matrix_world.inverted()) # 4x4
-        
-        # Homogeneous transform
-        ones = np.ones((len(positions), 1), dtype=np.float32)
-        pos_homo = np.hstack((positions, ones)) # Nx4
-        
-        # Apply Inverse Matrix
-        # positions_local = pos_homo @ matrix_inv.T
-        positions_local_homo = pos_homo @ matrix_inv.T
-        positions = positions_local_homo[:, :3].astype(np.float32)
-
-        # Set particles
-        # Ensure contiguous float32 arrays
-        positions = np.ascontiguousarray(positions, dtype=np.float32)
-        radii = np.ascontiguousarray(radii, dtype=np.float32)
-        if velocities is not None:
-            velocities = np.ascontiguousarray(velocities, dtype=np.float32)
-        
-        # Apply Union of Spheres radius scaling
-        if frost_props.meshing_method == '0': # Union of Spheres
-            radii = radii * frost_props.union_of_spheres_radius_scale
-        
-        # Safety Check 1: Prevent 0-radius particles (Causes Crash in Subdivide Max Radius mode)
-        # Verify valid radii
-        if len(radii) > 0:
-            epsilon_radius = 1e-4
-            # Use maximum to avoid setting *all* to epsilon if just one is bad? 
-            # Actually, we want to ensure *max_radius* is not 0 for Mode 0.
-            # But safer to just clamp all radii to a tiny +ve value.
-            radii = np.maximum(radii, epsilon_radius)
-
-        # Safety Check 2: Prevent 0-volume binding box (Causes Crash in Grid)
-        if len(positions) > 0:
+        # Safety Check: Estimate Voxel Grid Size
+        # Grid size ~ (bounding_box / voxel_size)^3
+        # If this is too large, skip to avoid memory exhaustion
+        if particle_count > 10000:  # Only check for larger counts
             min_bound = np.min(positions, axis=0)
             max_bound = np.max(positions, axis=0)
-            size = max_bound - min_bound
+            bbox_size = max_bound - min_bound
             
-            # If any dimension is flat (e.g. 2D plane), add epsilon
-            epsilon_bounds = 1e-4
-            if np.any(size < epsilon_bounds):
-                if size[0] < epsilon_bounds: positions[0, 0] += epsilon_bounds
-                if size[1] < epsilon_bounds: positions[0, 1] += epsilon_bounds
-                if size[2] < epsilon_bounds: positions[0, 2] += epsilon_bounds
+            voxel_size = frost_props.meshing_voxel_length
+            if voxel_size < 0.01:  # Very fine resolution
+                estimated_voxels = np.prod(bbox_size / max(voxel_size, 0.001))
+                if estimated_voxels > 500_000_000:  # 500M voxels is dangerous
+                    print(f"Frost Warning: Skipping meshing - Estimated voxel count ({estimated_voxels:.0f}) too large.")
+                    print(f"  -> Increase Voxel Length to prevent crashes.")
+                    return
 
-        frost.set_particles(positions, radii, velocities)
+        # Initialize Frost - use cached instance for performance
+        try:
+            gpu_backend_available = has_gpu_backend()
+            gpu_backend_name = get_gpu_backend_name()
+            if frost_props.use_gpu and not gpu_backend_available and frost_props.show_debug_log:
+                print(f"Frost: no GPU backend is available in the current native build ({gpu_backend_name}), falling back to CPU.")
+            
+            # Transform World Space Particles -> Local Space of Frost Object
+            # Extracted particles are in World Space.
+            # But we are writing to obj.data (Mesh). 
+            # Blender applies obj.matrix_world to the mesh.
+            # So: FinalPos = ObjMatrix * VertexPos
+            # We want FinalPos == WorldSpaceParticle
+            # Therefore: VertexPos = Inverse(ObjMatrix) * WorldSpaceParticle
+            
+            matrix_inv = np.array(obj.matrix_world.inverted()) # 4x4
+            
+            # Homogeneous transform
+            ones = np.ones((len(positions), 1), dtype=np.float32)
+            pos_homo = np.hstack((positions, ones)) # Nx4
+            
+            # Apply Inverse Matrix
+            positions_local_homo = pos_homo @ matrix_inv.T
+            positions = positions_local_homo[:, :3].astype(np.float32)
 
-        
-        # Set parameters
-        params = {
-            "meshing_method": int(frost_props.meshing_method),
-            "meshing_resolution_mode": int(frost_props.meshing_resolution_mode),
-            "resolution": frost_props.meshing_resolution,
-            "voxel_size": frost_props.meshing_voxel_length,
+            # Set particles
+            positions = np.ascontiguousarray(positions, dtype=np.float32)
+            radii = np.ascontiguousarray(radii, dtype=np.float32)
+            if velocities is not None:
+                velocities = np.ascontiguousarray(velocities, dtype=np.float32)
             
-            # Adaptive Resolution
-            "vert_refinement": frost_props.vert_refinement,
+            # Apply Union of Spheres radius scaling
+            if frost_props.meshing_method == '0': # Union of Spheres
+                radii = radii * frost_props.union_of_spheres_radius_scale
             
-            # Post Processing
-            "relax_iterations": frost_props.relax_iterations,
-            "relax_strength": frost_props.relax_strength,
-            "push_distance": frost_props.push_distance,
+            if len(radii) > 0:
+                epsilon_radius = 1e-4
+                radii = np.maximum(radii, epsilon_radius)
 
-            # Union of Spheres
-            "union_of_spheres_radius_scale": frost_props.union_of_spheres_radius_scale,
+            if len(positions) > 0:
+                min_bound = np.min(positions, axis=0)
+                max_bound = np.max(positions, axis=0)
+                size = max_bound - min_bound
+                
+                epsilon_bounds = 1e-4
+                if np.any(size < epsilon_bounds):
+                    if size[0] < epsilon_bounds: positions[0, 0] += epsilon_bounds
+                    if size[1] < epsilon_bounds: positions[0, 1] += epsilon_bounds
+                    if size[2] < epsilon_bounds: positions[0, 2] += epsilon_bounds
 
-            # Metaball
-            "metaball_radius_scale": frost_props.metaball_radius_scale,
-            "metaball_isosurface_level": frost_props.metaball_isosurface_level,
+            params = {
+                "meshing_method": int(frost_props.meshing_method),
+                "meshing_resolution_mode": int(frost_props.meshing_resolution_mode),
+                "resolution": frost_props.meshing_resolution,
+                "voxel_size": frost_props.meshing_voxel_length,
+                
+                # Adaptive Resolution
+                "vert_refinement": frost_props.vert_refinement,
+                
+                # Post Processing
+                "relax_iterations": frost_props.relax_iterations,
+                "relax_strength": frost_props.relax_strength,
+                "push_distance": frost_props.push_distance,
+
+                # Union of Spheres
+                "union_of_spheres_radius_scale": frost_props.union_of_spheres_radius_scale,
+
+                # Metaball
+                "metaball_radius_scale": frost_props.metaball_radius_scale,
+                "metaball_isosurface_level": frost_props.metaball_isosurface_level,
+                
+                # Plain Marching Cubes
+                "plain_marching_cubes_radius_scale": frost_props.plain_marching_cubes_radius_scale,
+                "plain_marching_cubes_isovalue": frost_props.plain_marching_cubes_isovalue,
+                
+                # Zhu-Bridson
+                "zhu_bridson_blend_radius_scale": frost_props.zhu_bridson_blend_radius_scale,
+                "zhu_bridson_low_density_trimming": False,
+                "zhu_bridson_trimming_threshold": 0.0,
+                "zhu_bridson_trimming_strength": 0.0,
+                
+                # Anisotropic
+                "anisotropic_radius_scale": frost_props.anisotropic_radius_scale,
+                "anisotropic_isosurface_level": frost_props.anisotropic_isosurface_level,
+                "anisotropic_max_anisotropy": frost_props.anisotropic_max_anisotropy,
+                "anisotropic_min_neighbor_count": frost_props.anisotropic_min_neighbor_count,
+                "anisotropic_position_smoothing_weight": frost_props.anisotropic_position_smoothing_weight,
+                
+                # GPU settings
+                "use_gpu": bool(frost_props.use_gpu and gpu_backend_available),
+                "gpu_search_radius_scale": frost_props.gpu_search_radius_scale,
+                "gpu_voxel_size": frost_props.gpu_voxel_size,
+                "gpu_block_size": 256,
+                "gpu_surface_refinement": 0,
+                
+                # Debug
+                "show_debug_log": frost_props.show_debug_log,
+            }
+
+            def run_mesher(use_gpu_flag):
+                frost = get_cached_frost(obj_id)
+                frost.set_particles(positions, radii, velocities)
+                params_to_apply = dict(params)
+                params_to_apply["use_gpu"] = bool(use_gpu_flag and gpu_backend_available)
+                frost.set_parameters(params_to_apply)
+                vertices_local, faces_local = frost.generate_mesh()
+                if hasattr(frost, "get_last_meshing_info"):
+                    meshing_info_local = frost.get_last_meshing_info()
+                else:
+                    meshing_info_local = {
+                        "backend": "cpu",
+                        "status": "Meshing completed.",
+                        "used_fallback": False,
+                    }
+                return vertices_local, faces_local, meshing_info_local
+
+            vertices, faces, meshing_info = run_mesher(frost_props.use_gpu)
+            is_valid, validation_error = validate_mesh_arrays(vertices, faces)
+
+            if not is_valid and frost_props.use_gpu:
+                print(f"Frost Warning: GPU mesh validation failed for {obj.name}: {validation_error}")
+                clear_frost_cache(obj_id)
+                vertices, faces, meshing_info = run_mesher(False)
+                meshing_info = {
+                    "backend": "cpu-fallback",
+                    "status": f"GPU mesh rejected during validation: {validation_error}",
+                    "used_fallback": True,
+                }
+                is_valid, validation_error = validate_mesh_arrays(vertices, faces)
+
+            if not is_valid:
+                raise RuntimeError(f"Unsafe mesh buffers rejected: {validation_error}")
+
+            record_meshing_status(frost_props, frost_props.use_gpu, meshing_info)
             
-            # Plain Marching Cubes
-            "plain_marching_cubes_radius_scale": frost_props.plain_marching_cubes_radius_scale,
-            "plain_marching_cubes_isovalue": frost_props.plain_marching_cubes_isovalue,
+        except Exception as e:
+            traceback.print_exc()
+            print(f"Meshing failed: {str(e)}")
+            frost_props.last_meshing_backend = "error"
+            frost_props.last_meshing_status = _trim_status_message(str(e))
+            frost_props.last_meshing_used_fallback = bool(frost_props.use_gpu)
+            frost_props.last_meshing_had_gpu_request = bool(frost_props.use_gpu)
+            frost_props.last_meshing_timestamp = time.time()
+            clear_frost_cache(obj_id)
+            return
+        
+        if len(vertices) == 0:
+            return
+        
+        # Update Blender mesh data - OPTIMIZED
+        try:
+            mesh_data = obj.data
+            mesh_data.clear_geometry() # Clear existing data
             
-            # Zhu-Bridson
-            "zhu_bridson_blend_radius_scale": frost_props.zhu_bridson_blend_radius_scale,
-            "zhu_bridson_low_density_trimming": False,
-            "zhu_bridson_trimming_threshold": 0.0,
-            "zhu_bridson_trimming_strength": 0.0,
+            num_verts = len(vertices)
+            num_faces = len(faces)
             
-            # Anisotropic
-            "anisotropic_radius_scale": frost_props.anisotropic_radius_scale,
-            "anisotropic_isosurface_level": frost_props.anisotropic_isosurface_level,
-            "anisotropic_max_anisotropy": frost_props.anisotropic_max_anisotropy,
-            "anisotropic_min_neighbor_count": frost_props.anisotropic_min_neighbor_count,
-            "anisotropic_position_smoothing_weight": frost_props.anisotropic_position_smoothing_weight,
+            mesh_data.vertices.add(num_verts)
+            mesh_data.loops.add(num_faces * 3)
+            mesh_data.polygons.add(num_faces)
             
-            # GPU settings
-            "use_gpu": bool(frost_props.use_gpu and gpu_backend_available),
-            "gpu_search_radius_scale": frost_props.gpu_search_radius_scale,
-            "gpu_voxel_size": frost_props.gpu_voxel_size,
-            "gpu_block_size": 256,
-            "gpu_surface_refinement": 0,
+            verts_flat = np.ascontiguousarray(vertices.ravel(), dtype=np.float32)
+            faces_flat = np.ascontiguousarray(faces.ravel(), dtype=np.int32)
             
-            # Debug
-            "show_debug_log": frost_props.show_debug_log,
-        }
+            mesh_data.vertices.foreach_set("co", verts_flat)
+            mesh_data.polygons.foreach_set("loop_start", np.arange(0, num_faces * 3, 3, dtype=np.int32))
+            mesh_data.polygons.foreach_set("loop_total", np.full(num_faces, 3, dtype=np.int32))
+            mesh_data.loops.foreach_set("vertex_index", faces_flat)
+            
+            mesh_data.update()
+            
+            if frost_props.use_smooth_shading:
+                mesh_data.polygons.foreach_set("use_smooth", np.ones(num_faces, dtype=bool))
+            else:
+                mesh_data.polygons.foreach_set("use_smooth", np.zeros(num_faces, dtype=bool))
+            
+        except Exception as e:
+            print(f"Failed to update Blender mesh data: {str(e)}")
         
-        frost.set_parameters(params)
-        
-        # Generate mesh
-        vertices, faces = frost.generate_mesh()
-        
-        # Note: We keep frost in cache for reuse, no explicit cleanup needed
-        
-    except Exception as e:
-        traceback.print_exc()
-        print(f"Meshing failed: {str(e)}")
-        # Clear cache on error to force fresh instance next time
-        clear_frost_cache(id(obj))
-        return
-    
-    if len(vertices) == 0:
-        return
-    
-    # Update Blender mesh data - OPTIMIZED
-    try:
-        mesh_data = obj.data
-        mesh_data.clear_geometry() # Clear existing data
-        
-        # Use foreach_set for MUCH faster data transfer (10x-100x faster than from_pydata)
-        num_verts = len(vertices)
-        num_faces = len(faces)
-        
-        mesh_data.vertices.add(num_verts)
-        mesh_data.loops.add(num_faces * 3)
-        mesh_data.polygons.add(num_faces)
-        
-        # Flatten arrays for foreach_set
-        verts_flat = vertices.ravel()  # Nx3 -> flat array
-        faces_flat = faces.ravel()     # Mx3 -> flat array
-        
-        # Fast bulk copy
-        mesh_data.vertices.foreach_set("co", verts_flat)
-        mesh_data.polygons.foreach_set("loop_start", np.arange(0, num_faces * 3, 3, dtype=np.int32))
-        mesh_data.polygons.foreach_set("loop_total", np.full(num_faces, 3, dtype=np.int32))
-        mesh_data.loops.foreach_set("vertex_index", faces_flat)
-        
-        mesh_data.update()
-        
-        # Apply shading - BATCH mode (single API call)
-        if frost_props.use_smooth_shading:
-            mesh_data.polygons.foreach_set("use_smooth", np.ones(num_faces, dtype=bool))
-        else:
-            mesh_data.polygons.foreach_set("use_smooth", np.zeros(num_faces, dtype=bool))
-        
-    except Exception as e:
-        print(f"Failed to update Blender mesh data: {str(e)}")
-    
-    elapsed = time.time() - start_time
-    # print(f"Frost Update: {len(vertices)} verts in {elapsed:.3f}s")
+        elapsed = time.time() - start_time
+        # print(f"Frost Update: {len(vertices)} verts in {elapsed:.3f}s")
+    finally:
+        _updates_in_progress.discard(obj_id)
 
 
 class FROST_OT_generate_mesh(bpy.types.Operator):

@@ -2,12 +2,11 @@
 build/
 build_*/
 $(Configuration)/
-# Local build/versioning history. Keep out of the GitHub source repo.
-logs/
 temp_frost_update/
 frost_blender_addon.zip
 temp_*.py
 dist_packages/
+build_output.log
 
 # Native compilation artifacts
 *.obj
@@ -53,3 +52,12 @@ deps/vcpkg/packages/
 # Auto-generated agent rules (personalized per developer)
 .brainsync/
 .brainsync/agent-rules.md
+.agent/
+.agents/
+.cursor/
+.windsurfrules
+
+AGENT.md
+CLAUDE.md
+.agent-mem/
+test_frost.py

@@ -32,6 +32,9 @@ FROST_NATIVE_API int Frost_CopyFaces(void *handle, int *outFaces,
                                      size_t intCount);
 
 FROST_NATIVE_API const char *Frost_GetLastError(void *handle);
+FROST_NATIVE_API const char *Frost_GetLastMeshingBackend(void *handle);
+FROST_NATIVE_API const char *Frost_GetLastMeshingStatus(void *handle);
+FROST_NATIVE_API int Frost_GetLastMeshingUsedFallback(void *handle);
 FROST_NATIVE_API int Frost_HasGpuBackend();
 FROST_NATIVE_API int Frost_HasCudaBackend();
 FROST_NATIVE_API const char *Frost_GetGpuBackendName();

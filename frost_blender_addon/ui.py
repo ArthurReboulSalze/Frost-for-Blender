@@ -5,13 +5,39 @@ User interface for Frost particle meshing in the 3D Viewport.
 """
 
 import bpy
-from bpy.props import EnumProperty, FloatProperty, IntProperty, BoolProperty, PointerProperty
+from bpy.props import EnumProperty, FloatProperty, IntProperty, BoolProperty, PointerProperty, StringProperty
 from bpy.types import PropertyGroup, Panel
 import time
 
 # Simple debounce mechanism to prevent cascade updates
 _last_update_time = 0
 _update_pending = False
+
+
+def format_meshing_backend_label(backend_name):
+    backend_name = (backend_name or "").strip()
+    if not backend_name:
+        return "Unknown"
+
+    parts = backend_name.replace("_", " ").replace("-", " ").split()
+    formatted_parts = []
+    for part in parts:
+        lower = part.lower()
+        if lower == "cpu":
+            formatted_parts.append("CPU")
+        elif lower == "gpu":
+            formatted_parts.append("GPU")
+        elif lower == "raw":
+            formatted_parts.append("Raw")
+        elif lower == "fallback":
+            formatted_parts.append("Fallback")
+        elif lower == "vulkan":
+            formatted_parts.append("Vulkan")
+        elif lower == "cuda":
+            formatted_parts.append("CUDA")
+        else:
+            formatted_parts.append(part.capitalize())
+    return " ".join(formatted_parts)
 
 def update_mesh_callback(self, context):
     """Trigger mesh update if auto_update is enabled"""
@@ -159,6 +185,36 @@ class FrostProperties(PropertyGroup):
         description="Print verbose debug info to System Console",
         default=False,
         update=update_mesh_callback
+    )
+
+    last_meshing_backend: StringProperty(
+        name="Last Meshing Backend",
+        default="",
+        options={'HIDDEN'}
+    )
+
+    last_meshing_status: StringProperty(
+        name="Last Meshing Status",
+        default="",
+        options={'HIDDEN'}
+    )
+
+    last_meshing_used_fallback: BoolProperty(
+        name="Last Meshing Used Fallback",
+        default=False,
+        options={'HIDDEN'}
+    )
+
+    last_meshing_had_gpu_request: BoolProperty(
+        name="Last Meshing Had GPU Request",
+        default=False,
+        options={'HIDDEN'}
+    )
+
+    last_meshing_timestamp: FloatProperty(
+        name="Last Meshing Timestamp",
+        default=0.0,
+        options={'HIDDEN'}
     )
     
     # Primary Source
@@ -512,6 +568,19 @@ class FROST_PT_main_panel(Panel):
         gpu_toggle = row.row()
         gpu_toggle.enabled = gpu_backend_available
         gpu_toggle.prop(frost_props, "use_gpu", toggle=True, icon='SHADING_RENDERED')
+
+        if frost_props.last_meshing_backend and (frost_props.use_gpu or frost_props.last_meshing_had_gpu_request):
+            status_box = layout.box()
+            status_row = status_box.row()
+            status_row.alert = frost_props.last_meshing_used_fallback
+            status_icon = 'ERROR' if frost_props.last_meshing_used_fallback else 'CHECKMARK'
+            status_row.label(
+                text=f"Last Meshing: {format_meshing_backend_label(frost_props.last_meshing_backend)}",
+                icon=status_icon,
+            )
+            if frost_props.last_meshing_status:
+                detail_row = status_box.row()
+                detail_row.label(text=frost_props.last_meshing_status, icon='INFO')
         
         # Main Generate/Bake Button
         # Show Create button if no source, otherwise show Bake
@@ -608,10 +677,8 @@ class FROST_PT_main_panel(Panel):
 
         else:
             # === CPU MODE ===
-            if frost_props.use_gpu and gpu_backend_available and is_vulkan_backend:
-                warn_row = box.row()
-                warn_row.label(text="Experimental Vulkan backend: particle preprocessing uses Vulkan compute, final meshing still uses the Frost method below", icon='INFO')
-            elif frost_props.use_gpu and not gpu_backend_available:
+
+            if frost_props.use_gpu and not gpu_backend_available:
                 warn_row = box.row()
                 warn_row.label(text="Current build has no GPU backend, using CPU settings", icon='INFO')
             box.prop(frost_props, "meshing_method", text="")
@@ -719,6 +786,15 @@ class FROST_PT_info_panel(Panel):
                 text=f"Vulkan Buffers: {'Ready' if operator.has_vulkan_storage_buffer() else 'Not ready'}",
                 icon='CHECKMARK' if operator.has_vulkan_storage_buffer() else 'INFO'
             )
+            if frost_props.last_meshing_backend:
+                row = layout.row()
+                row.alert = frost_props.last_meshing_used_fallback
+                row.label(
+                    text=f"Last Meshing: {format_meshing_backend_label(frost_props.last_meshing_backend)}",
+                    icon='ERROR' if frost_props.last_meshing_used_fallback else 'CHECKMARK'
+                )
+                if frost_props.last_meshing_status:
+                    layout.label(text=frost_props.last_meshing_status, icon='INFO')
             if frost_props.use_gpu and operator.has_gpu_backend():
                  row = layout.row()
                  row.label(text="GPU Acceleration: Enabled", icon='SHADING_RENDERED')
